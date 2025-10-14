@@ -66,6 +66,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
+        
+        self._is_lora = hasattr(actor_module, 'peft_config') and actor_module.peft_config is not None
 
         self.compute_entropy_from_logits = (
             torch.compile(verl_F.entropy_from_logits, dynamic=True)
@@ -82,7 +84,7 @@ class DataParallelPPOActor(BasePPOActor):
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
-        if "multi_modal_inputs" in micro_batch:
+        if "multi_modal_inputs" in micro_batch.keys():
             for key in micro_batch["multi_modal_inputs"][0].keys():
                 multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0)
 
@@ -314,12 +316,45 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
+    def _validate_and_get_adapter(self, data: DataProto):
+        """
+        Validate batch consistency and return adapter name.
+        Reads from batch.non_tensor_batch["lora_ids"] to determine which adapter to use.
+        """
+        if not self._is_lora:
+            return None
+        
+        if "lora_ids" not in data.non_tensor_batch:
+            return None
+        
+        lora_ids = data.non_tensor_batch["lora_ids"]
+        if len(lora_ids) == 0:
+            return None
+        
+        unique_lora_ids = set(str(lid) for lid in lora_ids)
+        if len(unique_lora_ids) > 1:
+            raise ValueError(
+                f"Batch contains multiple LoRA adapters: {unique_lora_ids}. "
+                f"Each batch should contain data from only one agent."
+            )
+        
+        current_lora_id = str(lora_ids[0])
+        if 'agent_' in current_lora_id and 'lora_' in current_lora_id:
+            parts = current_lora_id.split('_')
+            adapter_idx = parts[-1]
+            adapter_name = f"agent_lora_{adapter_idx}"
+            return adapter_name
+        return None
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
-        # make sure we are in training mode
         self.actor_module.train()
+        
+        adapter_name = self._validate_and_get_adapter(data)
+        if adapter_name and hasattr(self.actor_module, 'set_adapter'):
+            self.actor_module.set_adapter(adapter_name)
 
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        temperature = data.meta_info["temperature"]
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
@@ -327,10 +362,10 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
-        if 'traj_mask' in data.batch:
+        if 'traj_mask' in data.batch.keys():
             select_keys.append('traj_mask')
 
-            if 'is_pad_step' in data.non_tensor_batch:
+            if 'is_pad_step' in data.non_tensor_batch.keys():
                 is_pad_step = data.non_tensor_batch["is_pad_step"]
                 pad_step_indices = np.where(is_pad_step == True)[0]
                 if len(pad_step_indices) > 0:
@@ -384,7 +419,7 @@ class DataParallelPPOActor(BasePPOActor):
                     attention_mask = data['attention_mask']
                     if multi_turn:
                         response_mask = data["loss_mask"][:, -response_length:]
-                    elif "traj_mask" in data:
+                    elif "traj_mask" in data.keys():
                         response_mask = data['traj_mask']
                     else:
                         response_mask = attention_mask[:, -response_length:]
@@ -461,18 +496,21 @@ class DataParallelPPOActor(BasePPOActor):
         return metrics
 
     def update_policy_mini_batch(self, data: DataProto):
-        # make sure we are in training mode
         self.actor_module.train()
+        
+        adapter_name = self._validate_and_get_adapter(data)
+        if adapter_name and hasattr(self.actor_module, 'set_adapter'):
+            self.actor_module.set_adapter(adapter_name)
 
-        temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
+        temperature = data.meta_info['temperature']
 
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
-        if 'traj_mask' in data.batch:
+        if 'traj_mask' in data.batch.keys():
             select_keys.append('traj_mask')
 
-            if 'is_pad_step' in data.non_tensor_batch:
+            if 'is_pad_step' in data.non_tensor_batch.keys():
                 is_pad_step = data.non_tensor_batch["is_pad_step"]
                 pad_step_indices = np.where(is_pad_step == True)[0]
                 if len(pad_step_indices) > 0:
@@ -504,7 +542,7 @@ class DataParallelPPOActor(BasePPOActor):
             response_length = responses.size(1)
             attention_mask = data['attention_mask']
             response_mask = attention_mask[:, -response_length:]
-            if "traj_mask" in data:
+            if "traj_mask" in data.keys():
                 response_mask = data['traj_mask']
             old_log_prob = data['old_log_probs']
             advantages = data['advantages']

@@ -152,9 +152,9 @@ def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
                                              dtype=torch.float32, device=batch.batch.device)
 
         # Try getting actual lengths from attention mask if possible (more accurate)
-        if 'response_mask' in batch.batch:
+        if 'response_mask' in batch.batch.keys():
              response_lengths_tensor = batch.batch['response_mask'].sum(dim=1).float()
-        if 'attention_mask' in batch.batch and 'response_mask' in batch.batch:
+        if 'attention_mask' in batch.batch.keys() and 'response_mask' in batch.batch.keys():
              full_mask = batch.batch['attention_mask']
              resp_mask = batch.batch['response_mask']
              # Infer prompt mask length based on where response mask starts or total length
@@ -1022,8 +1022,8 @@ class RaySPINTrainer:
 
                         # Pop keys for generation
                         pop_batch_keys=['input_ids', 'attention_mask']
-                        if 'position_ids' in batch.batch: pop_batch_keys.append('position_ids')
-                        pop_non_tensor_keys = ['raw_prompt_ids'] if 'raw_prompt_ids' in batch.non_tensor_batch else []
+                        if 'position_ids' in batch.batch.keys(): pop_batch_keys.append('position_ids')
+                        pop_non_tensor_keys = ['raw_prompt_ids'] if 'raw_prompt_ids' in batch.non_tensor_batch.keys() else []
                         if 'multi_modal_inputs' in batch.non_tensor_batch.keys():
                             pop_non_tensor_keys.extend(['multi_modal_data', 'multi_modal_inputs'])
                         original_non_tensor_data = batch.non_tensor_batch
