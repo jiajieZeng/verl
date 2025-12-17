@@ -459,7 +459,18 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
     _clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
     return total_norm
 
-def layered_summon_lora_params(fsdp_module)->OrderedDict:
+def layered_summon_lora_params(fsdp_module, adapter_name: str = None)->OrderedDict:
+    """
+    Collect LoRA parameters from FSDP wrapped PeftModel in a memory-efficient way.
+    
+    Args:
+        fsdp_module: FSDP wrapped module containing PeftModel
+        adapter_name: If specified, collect params for this specific adapter.
+                      Otherwise collect params for the currently active adapter.
+    
+    Returns:
+        OrderedDict of LoRA parameters
+    """
     from peft.utils.save_and_load import get_peft_model_state_dict
 
     def __prefix_submodules(module, prefix):
@@ -468,47 +479,61 @@ def layered_summon_lora_params(fsdp_module)->OrderedDict:
                 yield name, submodule
 
     lora_params = OrderedDict()
-    # Prefix list for different model architectures:
-    # - Standard CausalLM: model.model.layers
-    # - VLM (e.g., Qwen2.5-VL): model.language_model.layers, model.visual.blocks
-    prefix_list = [
-        '_fsdp_wrapped_module.base_model.model.',
-        '_fsdp_wrapped_module.base_model.model.model.',
-        '_fsdp_wrapped_module.base_model.model.model.layers.',
-        # VLM model structure support (e.g., Qwen2.5-VL, LLaVA, etc.)
-        '_fsdp_wrapped_module.base_model.model.language_model.',
-        '_fsdp_wrapped_module.base_model.model.language_model.layers.',
-        '_fsdp_wrapped_module.base_model.model.language_model.model.',
-        '_fsdp_wrapped_module.base_model.model.language_model.model.layers.',
-        # Qwen2.5-VL specific: model.model.language_model (extra 'model' level)
-        '_fsdp_wrapped_module.base_model.model.model.language_model.',
-        '_fsdp_wrapped_module.base_model.model.model.language_model.layers.',
-        # Qwen2.5-VL Visual Encoder support
-        '_fsdp_wrapped_module.base_model.model.model.visual.',
-        '_fsdp_wrapped_module.base_model.model.model.visual.blocks.',
-        '_fsdp_wrapped_module.base_model.model.model.visual.merger.',
-    ]
-    for prefix in prefix_list:
-        for module_name, submodule in __prefix_submodules(fsdp_module, prefix):
-            new_prefix = module_name.replace("_fsdp_wrapped_module.base_model.model.","base_model.model.")
-            # Skip container modules (not actual layers with LoRA params)
-            skip_suffixes = ('.model', '.layers', '.language_model', '.visual', '.blocks', '.merger')
-            if any(module_name.endswith(s) for s in skip_suffixes):
-                continue
-            if fsdp_version(submodule) > 0:
-                with FSDP.summon_full_params(submodule, writeback=False):
-                    sub_lora_params = get_peft_model_state_dict(fsdp_module._fsdp_wrapped_module, state_dict=submodule.state_dict())
-                    sub_lora_params = {f"{new_prefix}.{param_name}": param.full_tensor().detach().cpu() if hasattr(param, 'full_tensor') else param.detach().cpu()
-                        for param_name, param in sub_lora_params.items()}
-                    lora_params.update(sub_lora_params)
-                    submodule._is_root = False
-                torch.cuda.empty_cache()
+    peft_model = fsdp_module._fsdp_wrapped_module
     
-    if len(lora_params) == 0:
-        import warnings
-        warnings.warn(
-            "No LoRA parameters found! This may indicate that prefix_list doesn't match the model structure. "
-            "Please check the model architecture and update prefix_list in layered_summon_lora_params()."
-        )
+    # If adapter_name specified, switch to it first
+    original_adapter = None
+    if adapter_name is not None and hasattr(peft_model, 'active_adapter'):
+        original_adapter = peft_model.active_adapter
+        if hasattr(peft_model, 'set_adapter'):
+            peft_model.set_adapter(adapter_name)
+    
+    try:
+        # Prefix list for different model architectures:
+        # - Standard CausalLM: model.model.layers
+        # - VLM (e.g., Qwen2.5-VL): model.language_model.layers, model.visual.blocks
+        prefix_list = [
+            '_fsdp_wrapped_module.base_model.model.',
+            '_fsdp_wrapped_module.base_model.model.model.',
+            '_fsdp_wrapped_module.base_model.model.model.layers.',
+            # VLM model structure support (e.g., Qwen2.5-VL, LLaVA, etc.)
+            '_fsdp_wrapped_module.base_model.model.language_model.',
+            '_fsdp_wrapped_module.base_model.model.language_model.layers.',
+            '_fsdp_wrapped_module.base_model.model.language_model.model.',
+            '_fsdp_wrapped_module.base_model.model.language_model.model.layers.',
+            # Qwen2.5-VL specific: model.model.language_model (extra 'model' level)
+            '_fsdp_wrapped_module.base_model.model.model.language_model.',
+            '_fsdp_wrapped_module.base_model.model.model.language_model.layers.',
+            # Qwen2.5-VL Visual Encoder support
+            '_fsdp_wrapped_module.base_model.model.model.visual.',
+            '_fsdp_wrapped_module.base_model.model.model.visual.blocks.',
+            '_fsdp_wrapped_module.base_model.model.model.visual.merger.',
+        ]
+        for prefix in prefix_list:
+            for module_name, submodule in __prefix_submodules(fsdp_module, prefix):
+                new_prefix = module_name.replace("_fsdp_wrapped_module.base_model.model.","base_model.model.")
+                # Skip container modules (not actual layers with LoRA params)
+                skip_suffixes = ('.model', '.layers', '.language_model', '.visual', '.blocks', '.merger')
+                if any(module_name.endswith(s) for s in skip_suffixes):
+                    continue
+                if fsdp_version(submodule) > 0:
+                    with FSDP.summon_full_params(submodule, writeback=False):
+                        sub_lora_params = get_peft_model_state_dict(peft_model, state_dict=submodule.state_dict(), adapter_name=adapter_name)
+                        sub_lora_params = {f"{new_prefix}.{param_name}": param.full_tensor().detach().cpu() if hasattr(param, 'full_tensor') else param.detach().cpu()
+                            for param_name, param in sub_lora_params.items()}
+                        lora_params.update(sub_lora_params)
+                        submodule._is_root = False
+                    torch.cuda.empty_cache()
+        
+        if len(lora_params) == 0:
+            import warnings
+            warnings.warn(
+                "No LoRA parameters found! This may indicate that prefix_list doesn't match the model structure. "
+                "Please check the model architecture and update prefix_list in layered_summon_lora_params()."
+            )
+    finally:
+        # Restore original adapter if we changed it
+        if original_adapter is not None and hasattr(peft_model, 'set_adapter'):
+            peft_model.set_adapter(original_adapter)
     
     return lora_params
