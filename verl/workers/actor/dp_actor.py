@@ -67,7 +67,12 @@ class DataParallelPPOActor(BasePPOActor):
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
         
-        self._is_lora = hasattr(actor_module, 'peft_config') and actor_module.peft_config is not None
+        # Get the underlying module for LoRA detection (handle FSDP wrapping)
+        underlying_module = actor_module
+        if hasattr(actor_module, '_fsdp_wrapped_module'):
+            underlying_module = actor_module._fsdp_wrapped_module
+        self._is_lora = hasattr(underlying_module, 'peft_config') and underlying_module.peft_config is not None
+        self._underlying_module = underlying_module  # Store for set_adapter calls
 
         self.compute_entropy_from_logits = (
             torch.compile(verl_F.entropy_from_logits, dynamic=True)
@@ -273,6 +278,14 @@ class DataParallelPPOActor(BasePPOActor):
         """
         # set to eval
         self.actor_module.eval()
+        
+        # Switch to correct LoRA adapter if in multi-LoRA mode
+        # Skip adapter switching if computing ref log prob (adapters are disabled)
+        skip_adapter_switch = data.meta_info.get("skip_adapter_switch", False)
+        if not skip_adapter_switch:
+            adapter_name = self._validate_and_get_adapter(data)
+            if adapter_name and hasattr(self._underlying_module, 'set_adapter'):
+                self._underlying_module.set_adapter(adapter_name)
 
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
@@ -351,8 +364,8 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
         
         adapter_name = self._validate_and_get_adapter(data)
-        if adapter_name and hasattr(self.actor_module, 'set_adapter'):
-            self.actor_module.set_adapter(adapter_name)
+        if adapter_name and hasattr(self._underlying_module, 'set_adapter'):
+            self._underlying_module.set_adapter(adapter_name)
 
         temperature = data.meta_info["temperature"]
         multi_turn = data.meta_info.get("multi_turn", False)
@@ -499,8 +512,8 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
         
         adapter_name = self._validate_and_get_adapter(data)
-        if adapter_name and hasattr(self.actor_module, 'set_adapter'):
-            self.actor_module.set_adapter(adapter_name)
+        if adapter_name and hasattr(self._underlying_module, 'set_adapter'):
+            self._underlying_module.set_adapter(adapter_name)
 
         temperature = data.meta_info['temperature']
 

@@ -148,12 +148,18 @@ class AsyncvLLMServer(AsyncServerBase):
         model_name = "/".join(model_path.split("/")[-2:])
         local_path = copy_to_local(model_path)
         trust_remote_code = config.model.get("trust_remote_code", False)
+        
+        # Get LoRA configuration from model config
+        lora_rank = config.model.get("lora_rank", 0)
+        lora_enabled = lora_rank > 0
+        
         config = config.rollout
 
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
         max_model_len = config.max_model_len if config.max_model_len else config.prompt_length + config.response_length
-        max_model_len = max(max_model_len, 32768)
-        max_num_batched_tokens = max(config.get("max_num_batched_tokens", 32768), max_model_len)
+        # Don't force a minimum that's too large - use actual needed length for memory efficiency
+        # max_model_len = max(max_model_len, 32768)
+        max_num_batched_tokens = max(config.get("max_num_batched_tokens", 4096), max_model_len)
 
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
@@ -166,6 +172,16 @@ class AsyncvLLMServer(AsyncServerBase):
             if hasattr(SamplingParams(), str(k)):
                 kwargs[k] = config.get(k)
         print(f"override_generation_config: {kwargs}")
+        
+        # Build LoRA kwargs if enabled
+        lora_kwargs = {}
+        if lora_enabled:
+            lora_kwargs = {
+                "enable_lora": True,
+                "max_loras": 2,  # Support multiple LoRA adapters for multi-agent
+                "max_lora_rank": lora_rank,
+            }
+            print(f"[AsyncvLLMServer] LoRA enabled with rank={lora_rank}, max_loras=2")
 
         engine_args = AsyncEngineArgs(
             model=local_path,
@@ -189,6 +205,7 @@ class AsyncvLLMServer(AsyncServerBase):
             seed=self.vllm_dp_rank,
             max_num_seqs=256,
             hf_overrides={"max_position_embeddings": max_model_len},
+            **lora_kwargs,  # Add LoRA configuration
         )
 
         # init async llm engine

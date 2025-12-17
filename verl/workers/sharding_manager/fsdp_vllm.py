@@ -276,7 +276,18 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                     peft_config=asdict(peft_config),
                     lora_tensors=updated_params,
                 )
-                self.inference_engine.llm_engine.add_lora(lora_reqest)
+                # Handle different inference engine types:
+                # - LLM (standard mode): has llm_engine attribute
+                # - WorkerWrapperBase (SPMD mode): has worker attribute
+                if hasattr(self.inference_engine, 'llm_engine'):
+                    self.inference_engine.llm_engine.add_lora(lora_reqest)
+                elif hasattr(self.inference_engine, 'worker'):
+                    self.inference_engine.worker.add_lora(lora_reqest)
+                else:
+                    raise AttributeError(
+                        f"Cannot find add_lora method. inference_engine type: {type(self.inference_engine)}. "
+                        "Expected LLM (with llm_engine) or WorkerWrapperBase (with worker)."
+                    )
                 logger.info(f"vLLM load weights, loaded_params: {len(updated_params)}")
                 return
             else:

@@ -119,7 +119,12 @@ class ActorRolloutRefWorker(Worker):
         if not torch.distributed.is_initialized():
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
-            torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl" if is_cuda_available else "cpu:gloo,npu:hccl", rank=rank, world_size=world_size)
+            # torch.distributed.init_process_group(backend="cpu:gloo,cuda:nccl" if is_cuda_available else "cpu:gloo,npu:hccl", rank=rank, world_size=world_size)
+            torch.distributed.init_process_group(
+                backend="nccl",
+                rank=rank, 
+                world_size=world_size
+            )
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
@@ -276,14 +281,34 @@ class ActorRolloutRefWorker(Worker):
                 print("Applying LoRA to actor module")
                 actor_module.enable_input_require_grads()
                 # Convert config to regular Python types before creating PEFT model
-                lora_config = {
+                lora_config_dict = {
                     'task_type': TaskType.CAUSAL_LM,
                     'r': self.config.model.lora_rank,
                     'lora_alpha': self.config.model.lora_alpha,
                     'target_modules': convert_to_regular_types(self.config.model.target_modules),
                     'bias': "none"
                 }
-                actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+                lora_config = LoraConfig(**lora_config_dict)
+                actor_module = get_peft_model(actor_module, lora_config)
+                
+                # Multi-LoRA mode: create additional adapters for each agent
+                lora_num = getattr(self.config, 'lora_num', 1)
+                if lora_num > 1:
+                    print(f"Creating {lora_num} LoRA adapters for multi-agent training")
+                    for adapter_idx in range(lora_num):
+                        adapter_name = f"agent_lora_{adapter_idx}"
+                        if adapter_name != "default":
+                            # Add new adapter with same config
+                            actor_module.add_adapter(adapter_name, lora_config)
+                            print(f"  Created LoRA adapter: {adapter_name}")
+                    # List all available adapters
+                    if hasattr(actor_module, 'peft_config'):
+                        print(f"  Available adapters: {list(actor_module.peft_config.keys())}")
+                
+                # CRITICAL: Convert all parameters to uniform dtype for FSDP compatibility
+                # LoRA adapters may initialize with float32, causing dtype mismatch with bfloat16 base model
+                actor_module.to(torch_dtype)
+                print(f"Converted all LoRA parameters to {torch_dtype} for FSDP compatibility")
         torch.distributed.barrier()
 
         if self.rank == 0:
@@ -832,6 +857,8 @@ class ActorRolloutRefWorker(Worker):
         from contextlib import nullcontext
         is_lora = data.meta_info.pop("is_lora", False)
         adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+        # Pass flag to dp_actor to skip adapter switching when computing ref log prob
+        data.meta_info["skip_adapter_switch"] = is_lora
         data = data.to(get_torch_device().current_device())
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
@@ -1041,39 +1068,56 @@ class ActorRolloutRefWorker(Worker):
                 if dist.get_rank() == 0:
                     print(f"[rank-{self.rank}]: Saving {lora_num} LoRA adapters for multi-agent training")
                 
-                peft_config = {}
-                if dist.get_rank() == 0:
-                    peft_config = asdict(self.actor_module.peft_config.get('default', {}))
-                    peft_config['task_type'] = peft_config['task_type'].value
-                    peft_config['peft_type'] = peft_config['peft_type'].value
-                    peft_config['target_modules'] = list(peft_config['target_modules'])
-                
                 try:
                     if isinstance(self.actor_module_fsdp, FSDP):
                         self.actor_module_fsdp = self.actor_module_fsdp.cuda()
-                        lora_params = layered_summon_lora_params(self.actor_module_fsdp)
                         
-                        if dist.get_rank() == 0:
-                            # Save each agent's LoRA adapter to a separate directory
-                            for agent_name, lora_id in agent_lora_mapping.items():
+                        # Save each agent's LoRA adapter to a separate directory
+                        # NOTE: All ranks must execute layered_summon_lora_params together
+                        # because it uses FSDP.summon_full_params which requires all ranks to sync
+                        for agent_idx, (agent_name, lora_id) in enumerate(agent_lora_mapping.items()):
+                            adapter_name = f"agent_lora_{agent_idx}"
+                            
+                            # All ranks: switch to the adapter (needed for correct param collection)
+                            if hasattr(self.actor_module, 'set_adapter'):
+                                self.actor_module.set_adapter(adapter_name)
+                            
+                            # All ranks: collect FSDP params (requires NCCL sync)
+                            lora_params = layered_summon_lora_params(self.actor_module_fsdp)
+                            
+                            # Only rank 0: save files
+                            if dist.get_rank() == 0:
                                 lora_save_path = os.path.join(local_path, f"lora_adapter_{lora_id}")
                                 os.makedirs(lora_save_path, exist_ok=True)
                                 
-                                # Save the same LoRA params for now (in future, could save agent-specific params)
+                                # Get peft_config for this adapter
+                                adapter_config = self.actor_module.peft_config.get(adapter_name, self.actor_module.peft_config.get('default', {}))
+                                peft_config = asdict(adapter_config)
+                                peft_config['task_type'] = peft_config['task_type'].value
+                                peft_config['peft_type'] = peft_config['peft_type'].value
+                                # Fix: target_modules can be a string (regex) or iterable
+                                # Only convert to list if it's not already a string
+                                if not isinstance(peft_config['target_modules'], str):
+                                    peft_config['target_modules'] = list(peft_config['target_modules'])
+                                peft_config['agent_name'] = agent_name
+                                peft_config['lora_id'] = lora_id
+                                peft_config['adapter_name'] = adapter_name
+                                
                                 save_file(lora_params, os.path.join(lora_save_path, "adapter_model.safetensors"))
                                 
-                                # Add agent_name to config for identification
-                                agent_peft_config = peft_config.copy()
-                                agent_peft_config['agent_name'] = agent_name
-                                agent_peft_config['lora_id'] = lora_id
-                                
                                 with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding='utf-8') as f:
-                                    json.dump(agent_peft_config, f, ensure_ascii=False, indent=4)
+                                    json.dump(peft_config, f, ensure_ascii=False, indent=4)
                                 
-                                print(f"[rank-{self.rank}]: Saved LoRA adapter for agent '{agent_name}' (ID: {lora_id}) to: {lora_save_path}")
+                                print(f"[rank-{self.rank}]: Saved LoRA adapter '{adapter_name}' for agent '{agent_name}' (ID: {lora_id}) to: {lora_save_path}")
+                        
+                        # All ranks: switch back to default adapter
+                        if hasattr(self.actor_module, 'set_adapter'):
+                            self.actor_module.set_adapter('default')
                 except Exception as e:
                     if dist.get_rank() == 0:
                         print(f"[rank-{self.rank}]: Save Multi-LoRA Adapter Error ({e})")
+                        import traceback
+                        traceback.print_exc()
             else:
                 # Single LoRA mode: original behavior
                 lora_save_path = os.path.join(local_path, "lora_adapter")
@@ -1083,7 +1127,10 @@ class ActorRolloutRefWorker(Worker):
                     peft_config = asdict(self.actor_module.peft_config.get('default', {}))
                     peft_config['task_type'] = peft_config['task_type'].value
                     peft_config['peft_type'] = peft_config['peft_type'].value
-                    peft_config['target_modules'] = list(peft_config['target_modules'])
+                    # Fix: target_modules can be a string (regex) or iterable
+                    # Only convert to list if it's not already a string
+                    if not isinstance(peft_config['target_modules'], str):
+                        peft_config['target_modules'] = list(peft_config['target_modules'])
                 try:
                     if isinstance(self.actor_module_fsdp, FSDP):
                         self.actor_module_fsdp = self.actor_module_fsdp.cuda()
@@ -1097,7 +1144,8 @@ class ActorRolloutRefWorker(Worker):
                     if dist.get_rank() == 0:
                         print(f"[rank-{self.rank}]: Save LoRA Adapter Error ({e})")
         else:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+            # Note: FSDP, StateDictType, FullStateDictConfig are already imported at the top of this file
+            # Do NOT add a local import here - it would cause UnboundLocalError for FSDP usage above
             cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
             with FSDP.state_dict_type(self.actor.actor_module, StateDictType.FULL_STATE_DICT, cfg):
                 state_dict = self.actor.actor_module.state_dict()
@@ -1121,43 +1169,46 @@ class ActorRolloutRefWorker(Worker):
 
         # Load LoRA adapters if applicable
         if self._is_lora and isinstance(self.actor_module, PeftModel):
-            # Multi-LoRA mode: check for multiple LoRA adapter directories
+            # Multi-LoRA mode: load each agent's LoRA adapter
             if lora_num > 1 and agent_lora_mapping is not None:
                 if dist.get_rank() == 0:
                     print(f"[rank-{self.rank}]: Loading {lora_num} LoRA adapters for multi-agent training")
                 
-                # Try to load from the first available LoRA adapter directory
-                # In multi-LoRA mode, all adapters are currently the same, so load any one
-                loaded = False
-                for agent_name, lora_id in agent_lora_mapping.items():
+                loaded_count = 0
+                for agent_idx, (agent_name, lora_id) in enumerate(agent_lora_mapping.items()):
+                    adapter_name = f"agent_lora_{agent_idx}"
                     lora_load_path = os.path.join(local_path, f"lora_adapter_{lora_id}")
+                    
                     if os.path.exists(lora_load_path):
                         try:
                             from safetensors.torch import load_file
                             lora_params = load_file(os.path.join(lora_load_path, "adapter_model.safetensors"))
                             
-                            # Load LoRA parameters into the model
-                            if dist.get_rank() == 0:
-                                print(f"[rank-{self.rank}]: Loading LoRA adapter from agent '{agent_name}' (ID: {lora_id})")
+                            # Switch to the target adapter before loading
+                            if hasattr(self.actor_module, 'set_adapter'):
+                                self.actor_module.set_adapter(adapter_name)
                             
-                            # Note: This is a simplified loading - in a full implementation,
-                            # you would need to properly load each agent's specific LoRA params
-                            # For now, we load the first one found
+                            # Load LoRA parameters into the model
                             model_state_dict = self.actor_module.state_dict()
                             for key, value in lora_params.items():
                                 if key in model_state_dict:
-                                    model_state_dict[key].copy_(value)
+                                    # Convert to target dtype and device to avoid dtype mismatch
+                                    target_tensor = model_state_dict[key]
+                                    model_state_dict[key].copy_(value.to(dtype=target_tensor.dtype, device=target_tensor.device))
                             
-                            loaded = True
+                            loaded_count += 1
                             if dist.get_rank() == 0:
-                                print(f"[rank-{self.rank}]: Successfully loaded multi-LoRA adapter from: {lora_load_path}")
-                            break
+                                print(f"[rank-{self.rank}]: Loaded LoRA adapter '{adapter_name}' for agent '{agent_name}' from: {lora_load_path}")
                         except Exception as e:
                             if dist.get_rank() == 0:
-                                print(f"[rank-{self.rank}]: Failed to load LoRA from {lora_load_path}: {e}")
+                                print(f"[rank-{self.rank}]: Failed to load LoRA for adapter '{adapter_name}' from {lora_load_path}: {e}")
                 
-                if not loaded and dist.get_rank() == 0:
-                    print(f"[rank-{self.rank}]: Warning - No multi-LoRA adapters found in {local_path}")
+                # Switch back to default adapter
+                if hasattr(self.actor_module, 'set_adapter'):
+                    self.actor_module.set_adapter('default')
+                
+                if dist.get_rank() == 0:
+                    print(f"[rank-{self.rank}]: Loaded {loaded_count}/{lora_num} multi-LoRA adapters from {local_path}")
             else:
                 # Single LoRA mode: try to load from standard lora_adapter directory
                 lora_load_path = os.path.join(local_path, "lora_adapter")
@@ -1169,7 +1220,9 @@ class ActorRolloutRefWorker(Worker):
                         model_state_dict = self.actor_module.state_dict()
                         for key, value in lora_params.items():
                             if key in model_state_dict:
-                                model_state_dict[key].copy_(value)
+                                # Convert to target dtype and device to avoid dtype mismatch
+                                target_tensor = model_state_dict[key]
+                                model_state_dict[key].copy_(value.to(dtype=target_tensor.dtype, device=target_tensor.device))
                         
                         if dist.get_rank() == 0:
                             print(f"[rank-{self.rank}]: Successfully loaded single LoRA adapter from: {lora_load_path}")

@@ -61,11 +61,12 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
     return tokenizer
 
 
-def hf_processor(name_or_path, **kwargs):
+def hf_processor(name_or_path, use_fast=True, **kwargs):
     """Create a huggingface processor to process multimodal data.
 
     Args:
         name_or_path (str): The name of the processor.
+        use_fast (bool): Whether to use the fast processor. Defaults to True for better performance.
 
     Returns:
         transformers.ProcessorMixin: The pretrained processor.
@@ -73,7 +74,7 @@ def hf_processor(name_or_path, **kwargs):
     from transformers import AutoProcessor
 
     try:
-        processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)
+        processor = AutoProcessor.from_pretrained(name_or_path, use_fast=use_fast, **kwargs)
     except Exception:
         processor = None
     # Avoid load tokenizer, see:
