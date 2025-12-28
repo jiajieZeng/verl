@@ -626,8 +626,18 @@ class ActorRolloutRefWorker(Worker):
             )
 
             # get the original unwrapped module
-            if fsdp_version(self.actor_module_fsdp) == 1:
+            fsdp_ver = fsdp_version(self.actor_module_fsdp)
+            if fsdp_ver == 1:
                 self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
+            elif fsdp_ver == 2:
+                # For FSDP2, the module itself is the wrapped module
+                self.actor_module = self.actor_module_fsdp
+            else:
+                # Fallback: use the FSDP module directly
+                self.actor_module = self.actor_module_fsdp
+            
+            if self.rank == 0:
+                print(f"[rank-{self.rank}]: FSDP version={fsdp_ver}, actor_module type={type(self.actor_module).__name__}, has peft_config={hasattr(self.actor_module, 'peft_config')}")
 
             if self._is_offload_param:
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
@@ -1062,14 +1072,25 @@ class ActorRolloutRefWorker(Worker):
         self.checkpoint_manager.save_checkpoint(local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep)
         dist.barrier()
 
-        if self._is_lora and isinstance(self.actor_module, PeftModel):
+        # Get the underlying PeftModel - try multiple approaches to handle FSDP wrapping
+        peft_model = getattr(self, "actor_module", None)
+        if peft_model is None:
+            peft_model = self.actor_module_fsdp
+        
+        # Check if we have a PeftModel using hasattr instead of isinstance (more robust with FSDP)
+        has_peft_config = hasattr(peft_model, 'peft_config') and peft_model.peft_config is not None
+        
+        if dist.get_rank() == 0:
+            print(f"[rank-{self.rank}]: LoRA check - _is_lora={self._is_lora}, has_peft_config={has_peft_config}, peft_model type={type(peft_model).__name__}")
+        
+        if self._is_lora and has_peft_config:
             # Multi-LoRA mode: save each agent's LoRA adapter separately
             if lora_num > 1 and agent_lora_mapping is not None:
                 if dist.get_rank() == 0:
                     print(f"[rank-{self.rank}]: Saving {lora_num} LoRA adapters for multi-agent training")
                 
                 try:
-                    if isinstance(self.actor_module_fsdp, FSDP):
+                    if fsdp_version(self.actor_module_fsdp) > 0:
                         self.actor_module_fsdp = self.actor_module_fsdp.cuda()
                         
                         # Save each agent's LoRA adapter to a separate directory
@@ -1079,11 +1100,11 @@ class ActorRolloutRefWorker(Worker):
                             adapter_name = f"agent_lora_{agent_idx}"
                             
                             # All ranks: switch to the adapter (needed for correct param collection)
-                            if hasattr(self.actor_module, 'set_adapter'):
-                                self.actor_module.set_adapter(adapter_name)
+                            if hasattr(peft_model, 'set_adapter'):
+                                peft_model.set_adapter(adapter_name)
                             
                             # All ranks: collect FSDP params (requires NCCL sync)
-                            lora_params = layered_summon_lora_params(self.actor_module_fsdp)
+                            lora_params = layered_summon_lora_params(self.actor_module_fsdp, adapter_name=adapter_name)
                             
                             # Only rank 0: save files
                             if dist.get_rank() == 0:
@@ -1091,7 +1112,7 @@ class ActorRolloutRefWorker(Worker):
                                 os.makedirs(lora_save_path, exist_ok=True)
                                 
                                 # Get peft_config for this adapter
-                                adapter_config = self.actor_module.peft_config.get(adapter_name, self.actor_module.peft_config.get('default', {}))
+                                adapter_config = peft_model.peft_config.get(adapter_name, peft_model.peft_config.get('default', {}))
                                 peft_config = asdict(adapter_config)
                                 peft_config['task_type'] = peft_config['task_type'].value
                                 peft_config['peft_type'] = peft_config['peft_type'].value
@@ -1111,8 +1132,8 @@ class ActorRolloutRefWorker(Worker):
                                 print(f"[rank-{self.rank}]: Saved LoRA adapter '{adapter_name}' for agent '{agent_name}' (ID: {lora_id}) to: {lora_save_path}")
                         
                         # All ranks: switch back to default adapter
-                        if hasattr(self.actor_module, 'set_adapter'):
-                            self.actor_module.set_adapter('default')
+                        if hasattr(peft_model, 'set_adapter'):
+                            peft_model.set_adapter('default')
                 except Exception as e:
                     if dist.get_rank() == 0:
                         print(f"[rank-{self.rank}]: Save Multi-LoRA Adapter Error ({e})")
@@ -1124,7 +1145,7 @@ class ActorRolloutRefWorker(Worker):
                 peft_config = {}
                 if dist.get_rank() == 0:
                     os.makedirs(lora_save_path, exist_ok=True)
-                    peft_config = asdict(self.actor_module.peft_config.get('default', {}))
+                    peft_config = asdict(peft_model.peft_config.get('default', {}))
                     peft_config['task_type'] = peft_config['task_type'].value
                     peft_config['peft_type'] = peft_config['peft_type'].value
                     # Fix: target_modules can be a string (regex) or iterable
@@ -1132,7 +1153,7 @@ class ActorRolloutRefWorker(Worker):
                     if not isinstance(peft_config['target_modules'], str):
                         peft_config['target_modules'] = list(peft_config['target_modules'])
                 try:
-                    if isinstance(self.actor_module_fsdp, FSDP):
+                    if fsdp_version(self.actor_module_fsdp) > 0:
                         self.actor_module_fsdp = self.actor_module_fsdp.cuda()
                         lora_params = layered_summon_lora_params(self.actor_module_fsdp)
                         if dist.get_rank() == 0:
@@ -1167,8 +1188,16 @@ class ActorRolloutRefWorker(Worker):
 
         self.checkpoint_manager.load_checkpoint(local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load)
 
+        # Get the underlying PeftModel - try multiple approaches to handle FSDP wrapping
+        peft_model = getattr(self, "actor_module", None)
+        if peft_model is None:
+            peft_model = self.actor_module_fsdp
+        
+        # Check if we have a PeftModel using hasattr instead of isinstance (more robust with FSDP)
+        has_peft_config = hasattr(peft_model, 'peft_config') and peft_model.peft_config is not None
+        
         # Load LoRA adapters if applicable
-        if self._is_lora and isinstance(self.actor_module, PeftModel):
+        if self._is_lora and has_peft_config:
             # Multi-LoRA mode: load each agent's LoRA adapter
             if lora_num > 1 and agent_lora_mapping is not None:
                 if dist.get_rank() == 0:
@@ -1185,11 +1214,11 @@ class ActorRolloutRefWorker(Worker):
                             lora_params = load_file(os.path.join(lora_load_path, "adapter_model.safetensors"))
                             
                             # Switch to the target adapter before loading
-                            if hasattr(self.actor_module, 'set_adapter'):
-                                self.actor_module.set_adapter(adapter_name)
+                            if hasattr(peft_model, 'set_adapter'):
+                                peft_model.set_adapter(adapter_name)
                             
                             # Load LoRA parameters into the model
-                            model_state_dict = self.actor_module.state_dict()
+                            model_state_dict = peft_model.state_dict()
                             for key, value in lora_params.items():
                                 if key in model_state_dict:
                                     # Convert to target dtype and device to avoid dtype mismatch
@@ -1204,8 +1233,8 @@ class ActorRolloutRefWorker(Worker):
                                 print(f"[rank-{self.rank}]: Failed to load LoRA for adapter '{adapter_name}' from {lora_load_path}: {e}")
                 
                 # Switch back to default adapter
-                if hasattr(self.actor_module, 'set_adapter'):
-                    self.actor_module.set_adapter('default')
+                if hasattr(peft_model, 'set_adapter'):
+                    peft_model.set_adapter('default')
                 
                 if dist.get_rank() == 0:
                     print(f"[rank-{self.rank}]: Loaded {loaded_count}/{lora_num} multi-LoRA adapters from {local_path}")
@@ -1217,7 +1246,7 @@ class ActorRolloutRefWorker(Worker):
                         from safetensors.torch import load_file
                         lora_params = load_file(os.path.join(lora_load_path, "adapter_model.safetensors"))
                         
-                        model_state_dict = self.actor_module.state_dict()
+                        model_state_dict = peft_model.state_dict()
                         for key, value in lora_params.items():
                             if key in model_state_dict:
                                 # Convert to target dtype and device to avoid dtype mismatch
@@ -1899,7 +1928,51 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
         """Called by ExternalRayDistributedExecutor collective_rpc."""
         if self.vllm_tp_rank == 0 and method != "execute_model":
             print(f"[DP={self.vllm_dp_rank},TP={self.vllm_tp_rank}] execute_method: {method if isinstance(method, str) else 'Callable'}")
+        
+        # Handle wake_up specially to sync multi-LoRA adapters
+        if method == "wake_up":
+            return self.wake_up()
+        elif method == "sleep":
+            return self.sleep()
+        
         return self.rollout.execute_method(method, *args, **kwargs)
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    def wake_up(self):
+        """
+        Wake up the rollout engine and sync LoRA adapters from FSDP to vLLM.
+        This delegates to vLLMAsyncRollout.wake_up() which calls sharding_manager.__enter__()
+        to properly sync weights (including multi-LoRA adapters).
+        """
+        if self.vllm_tp_rank == 0:
+            print(f"[DP={self.vllm_dp_rank},TP={self.vllm_tp_rank}] wake_up: triggering rollout wake_up...")
+        
+        # Call the original rollout.wake_up() which triggers sharding_manager.__enter__()
+        # This properly syncs all LoRA adapters (both single and multi-LoRA mode)
+        result = self.rollout.wake_up()
+        
+        if self.vllm_tp_rank == 0:
+            print(f"[DP={self.vllm_dp_rank},TP={self.vllm_tp_rank}] wake_up: completed")
+        
+        return result
+    
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    def sleep(self):
+        """
+        Put the rollout engine to sleep.
+        This delegates to vLLMAsyncRollout.sleep() which calls sharding_manager.__exit__()
+        to properly offload weights and free KV cache.
+        """
+        if self.vllm_tp_rank == 0:
+            print(f"[DP={self.vllm_dp_rank},TP={self.vllm_tp_rank}] sleep: triggering rollout sleep...")
+        
+        # Call the original rollout.sleep() which triggers sharding_manager.__exit__()
+        result = self.rollout.sleep()
+        
+        if self.vllm_tp_rank == 0:
+            print(f"[DP={self.vllm_dp_rank},TP={self.vllm_tp_rank}] sleep: completed")
+        
+        return result
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     def resume(self):
