@@ -140,6 +140,7 @@ class AsyncvLLMServer(AsyncServerBase):
         self.vllm_dp_rank = vllm_dp_rank
         self.wg_prefix = wg_prefix
         self.engine: AsyncLLM = None
+        self._workers = None  # 🔧 保存 worker 引用，用于 LoRA 同步
 
     async def init_engine(self):
         """Init vLLM AsyncLLM engine."""
@@ -152,6 +153,7 @@ class AsyncvLLMServer(AsyncServerBase):
         # Get LoRA configuration from model config
         lora_rank = config.model.get("lora_rank", 0)
         lora_enabled = lora_rank > 0
+        self.lora_enabled = lora_enabled  # 🔧 保存到实例，供 wake_up 使用
         
         config = config.rollout
 
@@ -216,7 +218,19 @@ class AsyncvLLMServer(AsyncServerBase):
 
         # build serving chat
         model_config = self.engine.model_config
+        # Register base model path
         BASE_MODEL_PATHS = [BaseModelPath(name=model_name, model_path=model_path)]
+        
+        # 🔧 Register LoRA adapter names so they can be used as model names in requests
+        # This allows requests with model="agent_lora_0" to be validated
+        if lora_enabled:
+            max_loras = lora_kwargs.get("max_loras", 2)
+            for i in range(max_loras):
+                adapter_name = f"agent_lora_{i}"
+                # Use a placeholder path since actual LoRA weights are loaded dynamically via sharding_manager
+                BASE_MODEL_PATHS.append(BaseModelPath(name=adapter_name, model_path=f"lora://{adapter_name}"))
+            print(f"[AsyncvLLMServer] Registered {max_loras} LoRA adapter names: {[f'agent_lora_{i}' for i in range(max_loras)]}")
+        
         models = OpenAIServingModels(self.engine, model_config, BASE_MODEL_PATHS)
         if config.chat_template:
             with open(config.chat_template, "r", encoding="utf-8") as f:
@@ -243,7 +257,52 @@ class AsyncvLLMServer(AsyncServerBase):
             return_tokens_as_token_ids=True,
         )
 
+        # 🔧 获取并保存 worker 引用，用于 LoRA 同步
+        self._init_workers()
+        
         print(f"Async vLLM Server running at {await self.get_server_address()}")
+    
+    def _init_workers(self):
+        """初始化 worker 引用，用于 wake_up/sleep 时同步 LoRA adapter"""
+        try:
+            vllm_tp_size = self.config.rollout.get("tensor_model_parallel_size", 1)
+            namespace = ray.get_runtime_context().namespace
+            
+            # 查找对应的 worker actors（使用当前 namespace）
+            # ray.util.list_named_actors() 返回当前 namespace 的 actor 名称列表
+            all_actors = ray.util.list_named_actors()
+            print(f"[AsyncvLLMServer] Found {len(all_actors)} named actors in namespace")
+            
+            # 筛选匹配的 worker actors
+            actor_names = [
+                actor_name for actor_name in all_actors
+                if actor_name.startswith(f"{self.wg_prefix}WorkerDict") or 
+                   actor_name.startswith(f"{self.wg_prefix}ActorRolloutRefWorker")
+            ]
+            print(f"[AsyncvLLMServer] Matched {len(actor_names)} actors with prefix '{self.wg_prefix}'")
+            
+            if len(actor_names) == 0:
+                print(f"[AsyncvLLMServer] Warning: No actors found with prefix '{self.wg_prefix}', all actors: {all_actors[:5]}...")
+                self._workers = None
+                return
+            
+            def get_pg_index_and_local_rank(actor_name):
+                fields = actor_name.split(":")
+                if len(fields) == 2:
+                    pg_index = int(fields[0].split("_")[-1])
+                    local_rank = int(fields[1])
+                    return pg_index, local_rank
+                return 0, 0
+            
+            actor_names = sorted(actor_names, key=get_pg_index_and_local_rank)
+            actor_names = actor_names[self.vllm_dp_rank * vllm_tp_size : (self.vllm_dp_rank + 1) * vllm_tp_size]
+            self._workers = [ray.get_actor(actor_name) for actor_name in actor_names]
+            print(f"[AsyncvLLMServer] Initialized with {len(self._workers)} workers for LoRA sync: {actor_names}")
+        except Exception as e:
+            import traceback
+            print(f"[AsyncvLLMServer] Warning: Failed to init workers for LoRA sync: {e}")
+            traceback.print_exc()
+            self._workers = None
 
     async def chat_completion(self, raw_request: Request):
         """OpenAI-compatible HTTP endpoint.
@@ -306,9 +365,33 @@ class AsyncvLLMServer(AsyncServerBase):
             yield 200, f"data: {data}\n\n"
 
     async def wake_up(self, tags: Optional[list[str]] = None):
+        # 🔧 只在 LoRA 模式下进行 LoRA adapter 同步
+        if getattr(self, 'lora_enabled', False) and self._workers:
+            try:
+                print(f"[AsyncvLLMServer] Calling wake_up on {len(self._workers)} workers...")
+                ray.get([worker.execute_method.remote("wake_up") for worker in self._workers])
+                print(f"[AsyncvLLMServer] LoRA adapters synced via worker wake_up")
+                
+                # 🔧 检查 LoRA 是否已加载
+                try:
+                    lora_list = await self.engine.list_loras()
+                    print(f"[AsyncvLLMServer] After wake_up, loaded LoRAs: {lora_list}")
+                except Exception as e:
+                    print(f"[AsyncvLLMServer] Could not list LoRAs: {e}")
+            except Exception as e:
+                import traceback
+                print(f"[AsyncvLLMServer] Warning: Failed to sync LoRA via worker wake_up: {e}")
+                traceback.print_exc()
+        # 🔧 全量微调模式下跳过 LoRA 同步，直接调用 engine wake_up
         await self.engine.wake_up(tags)
 
     async def sleep(self):
         # TODO: https://github.com/vllm-project/vllm/issues/17103
         await self.engine.reset_prefix_cache()
         await self.engine.sleep()
+        # 🔧 调用 worker 的 sleep，让 sharding_manager 退出
+        if self._workers:
+            try:
+                ray.get([worker.execute_method.remote("sleep") for worker in self._workers])
+            except Exception as e:
+                print(f"[AsyncvLLMServer] Warning: Failed to call worker sleep: {e}")
