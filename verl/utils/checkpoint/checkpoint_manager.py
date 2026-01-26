@@ -140,8 +140,10 @@ def is_valid_checkpoint(ckpt_path):
     """
 
     # 1) Check for required top-level files
+    # Note: data.pt is optional - it's only saved when dataloader state is needed
+    # The saving of data.pt is currently commented out in ray_trainer.py
     required_pt_files = [
-        'data.pt'
+        # 'data.pt'  # Optional: dataloader state, not always saved
     ]
     for fname in required_pt_files:
         full_file = os.path.join(ckpt_path, fname)
