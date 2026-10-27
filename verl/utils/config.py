@@ -71,6 +71,52 @@ def update_dict_with_config(dictionary: dict, config: DictConfig):
             dictionary[key] = getattr(config, key)
 
 
+def _validate_router_replay_config(actor_config: Any, rollout_correction: Any) -> None:
+    engine_config = getattr(actor_config, "engine", None)
+    router_replay = getattr(engine_config, "router_replay", None)
+    if (
+        getattr(router_replay, "mode", "disabled") == "R2"
+        and rollout_correction
+        and rollout_correction.get("bypass_mode", False)
+    ):
+        raise ValueError(
+            "router_replay.mode='R2' requires algorithm.rollout_correction.bypass_mode=False: "
+            "R2 records routes while recomputing actor old_log_probs, but bypass mode skips that forward."
+        )
+
+
+def _validate_score_centering_config(config: DictConfig) -> None:
+    algorithm_rc = config.algorithm.get("rollout_correction") or {}
+    actor_rc = config.actor_rollout_ref.actor.policy_loss.get("rollout_correction") or {}
+    if not (algorithm_rc.get("score_centering", False) or actor_rc.get("score_centering", False)):
+        return
+    if not (algorithm_rc.get("score_centering", False) and actor_rc.get("score_centering", False)):
+        raise ValueError(
+            "score centering must be enabled on both algorithm.rollout_correction and "
+            "actor_rollout_ref.actor.policy_loss.rollout_correction."
+        )
+    from verl.trainer.config.algorithm import RolloutCorrectionConfig
+
+    # the actor-side mirror is a plain mapping, so run the dataclass checks on it here
+    RolloutCorrectionConfig(**actor_rc)
+    for key in ("bypass_mode", "loss_type", "rollout_is", "rollout_is_threshold"):
+        if actor_rc.get(key) != algorithm_rc.get(key):
+            raise ValueError(
+                f"score centering requires actor_rollout_ref.actor.policy_loss.rollout_correction.{key} to match "
+                f"algorithm.rollout_correction.{key}."
+            )
+    if not config.trainer.get("use_v1", True):
+        raise ValueError("score centering requires the v1 trainer (trainer.use_v1=True).")
+    if config.actor_rollout_ref.actor.get("strategy") not in ("fsdp", "fsdp2"):
+        raise ValueError("score centering requires actor_rollout_ref.actor.strategy=fsdp or fsdp2.")
+    if config.actor_rollout_ref.rollout.get("name") != "vllm":
+        raise ValueError("score centering requires actor_rollout_ref.rollout.name=vllm.")
+    if not config.actor_rollout_ref.rollout.get("topk_log_probs", 0):
+        raise ValueError("score centering requires actor_rollout_ref.rollout.topk_log_probs > 0.")
+    if (config.get("distillation") or {}).get("enabled", False):
+        raise ValueError("score centering cannot be combined with distillation.")
+
+
 def validate_config(
     config: DictConfig,
     use_reference_policy: bool,
@@ -129,7 +175,6 @@ def validate_config(
             ValueError: If both parameters are set or neither is set.
         """
         settings = {
-            "reward_model": "micro_batch_size",
             "actor_rollout_ref.ref": "log_prob_micro_batch_size",
             "actor_rollout_ref.rollout": "log_prob_micro_batch_size",
         }
@@ -150,6 +195,8 @@ def validate_config(
     # Actor validation done in ActorConfig.__post_init__ and validate()
     actor_config = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
     actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
+    _validate_router_replay_config(actor_config, config.algorithm.get("rollout_correction", None))
+    _validate_score_centering_config(config)
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if use_reference_policy:
@@ -167,13 +214,7 @@ def validate_config(
             "actor_rollout_ref.rollout",
         )
 
-    # Check for reward model micro-batch size conflicts
-    if config.reward_model.enable and not config.reward_model.use_dynamic_bsz:
-        check_mutually_exclusive(
-            config.reward_model.micro_batch_size, config.reward_model.micro_batch_size_per_gpu, "reward_model"
-        )
-
-    if config.algorithm.use_kl_in_reward and config.actor_rollout_ref.actor.use_kl_loss:
+    if config.algorithm.get("use_kl_in_reward", False) and config.actor_rollout_ref.actor.use_kl_loss:
         print("NOTICE: You have both enabled in-reward kl and kl loss.")
 
     # critic
@@ -193,5 +234,17 @@ def validate_config(
         assert config.actor_rollout_ref.rollout.temperature > 0, (
             "validation gen temperature should be greater than 0 when enabling do_sample"
         )
+
+    # check LoRA rank in vLLM
+    lora_config = config.actor_rollout_ref.model.get("lora", {})
+    lora_rank = lora_config.get("rank", 0)
+    if lora_rank <= 0:
+        lora_rank = config.actor_rollout_ref.model.get("lora_rank", 0)
+    if lora_config.get("merge", False):
+        lora_rank = 0
+    if lora_rank > 0 and config.actor_rollout_ref.rollout.name == "vllm":
+        from verl.workers.rollout.vllm_rollout.utils import get_vllm_max_lora_rank
+
+        get_vllm_max_lora_rank(lora_rank)
 
     print("[validate_config] All configuration checks passed successfully!")

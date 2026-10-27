@@ -46,9 +46,30 @@ except ImportError:
     pass
 
 try:
+    from vllm.model_executor.models.qwen3_vl_moe import Qwen3MoeLLMForCausalLM
+
+    SUPPORTED_MOE_MODELS.append(Qwen3MoeLLMForCausalLM)
+except ImportError:
+    pass
+
+try:
+    from vllm.model_executor.models.qwen3_next import Qwen3NextForCausalLM
+
+    SUPPORTED_MOE_MODELS.append(Qwen3NextForCausalLM)
+except ImportError:
+    pass
+
+try:
     from vllm.model_executor.models.kimi_vl import KimiVLForConditionalGeneration
 
     SUPPORTED_MOE_MODELS.append(KimiVLForConditionalGeneration)
+except ImportError:
+    pass
+
+try:
+    from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForCausalLM
+
+    SUPPORTED_MOE_MODELS.append(Qwen3_5MoeForCausalLM)
 except ImportError:
     pass
 
@@ -75,10 +96,10 @@ def patch_vllm_moe_model_weight_loader(model):
     if not SUPPORTED_MOE_MODELS:
         return
 
-    if not isinstance(model, tuple(SUPPORTED_MOE_MODELS)):
-        return
-
     original_model_type = type(model)
+    if hasattr(model, "runnable") and "ACLGraphWrapper" in str(original_model_type):
+        model = model.runnable
+        original_model_type = type(model)
 
     # Define MLP attribute mapping for different model types
     MLP_ATTR_MAPPING = {}
@@ -96,6 +117,14 @@ def patch_vllm_moe_model_weight_loader(model):
     if inner_model is None:
         raise ValueError("The provided model does not have a valid 'model' or 'language_model' attribute.")
 
+    if not isinstance(model, tuple(SUPPORTED_MOE_MODELS)) and not isinstance(inner_model, tuple(SUPPORTED_MOE_MODELS)):
+        return
+
+    # TODO(@leisuzz): class Qwen3MoeLLMForCausalLM is not available if VLLM version < 0.11.0,
+    # will update the 'if statement' with 'isinstance' when verl commonly use VLLM version >= 0.11.0
+    if type(inner_model).__name__ in ("Qwen3MoeLLMForCausalLM", "Qwen3_5MoeForCausalLM"):
+        inner_model = inner_model.model  # Reassign inner_model in Qwen3-vl
+
     for layer_idx, layer in enumerate(inner_model.layers):
         mlp_attr = MLP_ATTR_MAPPING.get(original_model_type, DEFAULT_MLP_ATTR)
 
@@ -104,7 +133,18 @@ def patch_vllm_moe_model_weight_loader(model):
             continue
 
         experts = getattr(mlp, "experts", None)
-        if not experts or not hasattr(experts, "weight_loader"):
+        if not experts:
+            continue
+
+        # verl syncs plain HF names, not PEFT checkpoint names, so the LoRA MoE
+        # ``lora_base_layer_prefix`` (folded into a dotted param_name that
+        # getattr can't resolve) must be cleared. Runs before the
+        # ``weight_loader`` guard so LoRA-wrapped MoE (no weight_loader) is covered.
+        routed_experts = getattr(getattr(experts, "base_layer", None), "routed_experts", None)
+        if routed_experts is not None and getattr(routed_experts, "lora_base_layer_prefix", ""):
+            routed_experts.lora_base_layer_prefix = ""
+
+        if not hasattr(experts, "weight_loader"):
             continue
 
         # Patch the weight loaders

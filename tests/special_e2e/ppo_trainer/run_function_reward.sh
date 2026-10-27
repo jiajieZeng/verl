@@ -5,26 +5,26 @@ NUM_GPUS=${NUM_GPUS:-8}
 
 MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B}
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
-#huggingface-cli download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
+#hf download "${MODEL_ID}" --local-dir "${MODEL_PATH}"
 
 TRAIN_FILES=${TRAIN_FILES:-$HOME/data/gsm8k/train.parquet}
 VAL_FILES=${VAL_FILES:-$HOME/data/gsm8k/test.parquet}
 MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-512}
 MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-512}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN))}
 
 ENGINE=${ENGINE:-vllm}
-ROLLOUT_MODE=${ROLLOUT_MODE:-sync}
-
-RETURN_RAW_CHAT="False"
-SKIP_TOKENIZER_INIT=${SKIP_TOKENIZER_INIT:-False}
-if [ "$ROLLOUT_MODE" = "async" ]; then
-    RETURN_RAW_CHAT="True"
-    SKIP_TOKENIZER_INIT="True"
+if [ "$ENGINE" = "vllm" ]; then
+    export VLLM_USE_V1=1
 fi
+ROLLOUT_MODE="async"
 
-GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.8}
-ACTOR_FSDP_PARAM_OFFLOAD=${ACTOR_FSDP_PARAM_OFFLOAD:-False}
-ACTOR_FSDP_OPTIMIZER_OFFLOAD=${ACTOR_FSDP_OPTIMIZER_OFFLOAD:-False}
+RETURN_RAW_CHAT="True"
+SKIP_TOKENIZER_INIT="True"
+
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.7}
+ACTOR_FSDP_PARAM_OFFLOAD=${ACTOR_FSDP_PARAM_OFFLOAD:-True}
+ACTOR_FSDP_OPTIMIZER_OFFLOAD=${ACTOR_FSDP_OPTIMIZER_OFFLOAD:-True}
 REF_FSDP_PARAM_OFFLOAD=${REF_FSDP_PARAM_OFFLOAD:-True}
 RM_PAD=${RM_PAD:-True}
 FUSED_KERNELS=${FUSED_KERNELS:-False}
@@ -33,7 +33,7 @@ ADV_ESTIMATOR=${ADV_ESTIMATOR:-gae}
 LOSS_MODE=${LOSS_MODE:-vanilla}
 USE_KL=${USE_KL:-False}
 CUSTOM_REWARD_FN=${CUSTOM_REWARD_FN:-False}
-ENABLE_CHUNKED_PREFILL=${ENABLE_CHUNKED_PREFILL:-True} # For vLLM VLM placeholder issue: https://github.com/vllm-project/vllm/issues/15185
+ENABLE_CHUNKED_PREFILL=${ENABLE_CHUNKED_PREFILL:-True}
 STRATEGY=${STRATEGY:-fsdp}
 # LoRA config
 LORA_RANK=${LORA_RANK:-0}
@@ -56,6 +56,25 @@ SAVE_HF_MODEL=${SAVE_HF_MODEL:-False}
 FSDP_SIZE=${FSDP_SIZE:--1}
 SP_SIZE=${SP_SIZE:-1}
 
+########################### launch ###########################
+# uv (set VERL_USE_UV=0 for system python, as the ascend / rocm / trtllm images do):
+# GPU vllm/sglang x fsdp|megatron run every python entrypoint here — including the Ray
+# workers, via runtime_env.py_executable — through `uv run` on the matching extras of
+# the committed uv.lock, so the job needs no install step. Other backends / NPU fall
+# back to ambient python. Run from the verl repo root.
+LAUNCH=(python3)
+RAY=(ray_kwargs.ray_init.runtime_env.py_executable=null)
+if [ "${VERL_USE_UV:-1}" != 0 ] && [ "${DEVICE:-gpu}" = gpu ] && { [ "${ENGINE}" = vllm ] || [ "${ENGINE}" = sglang ]; }; then
+    # fsdp2 rides the same uv extra as fsdp; only the trainer strategy differs.
+    case "${STRATEGY}" in
+        megatron) TRAIN_EXTRA=megatron ;;
+        *)        TRAIN_EXTRA=fsdp ;;
+    esac
+    UV_EXTRAS=(--extra "${ENGINE}" --extra "${TRAIN_EXTRA}")
+    LAUNCH=(uv run --frozen --all-packages "${UV_EXTRAS[@]}" python3)
+    RAY=(ray_kwargs.ray_init.runtime_env.py_executable="uv -v run --frozen --all-packages ${UV_EXTRAS[*]}")
+fi
+
 if [ "${SAVE_HF_MODEL}" = "True" ]; then
     CHECKPOINT_CONTENTS="['model','hf_model','optimizer','extra']"
 else
@@ -65,9 +84,9 @@ fi
 train_traj_micro_bsz_per_gpu=2 # b
 n_resp_per_prompt=4 # g
 
-train_traj_micro_bsz=$((train_traj_micro_bsz_per_gpu * NUM_GPUS)) # b * n
+train_traj_micro_bsz=$((train_traj_micro_bsz_per_gpu * 1)) # b * n
 train_traj_mini_bsz=$((train_traj_micro_bsz * 2)) # 2 * b * n
-train_prompt_mini_bsz=$((train_traj_mini_bsz * n_resp_per_prompt)) # 2 * b * n / g
+train_prompt_mini_bsz=$((train_traj_mini_bsz * 2)) # 2 * b * n / g
 train_prompt_bsz=$((train_prompt_mini_bsz * 2)) # 4 * b * n / g
 
 reward_fn_name=null
@@ -88,7 +107,7 @@ fi
 
 exp_name="${VERL_EXP_NAME:-$(basename "${MODEL_ID,,}")-function-reward-minimal}"
 
-python3 -m verl.trainer.main_ppo \
+"${LAUNCH[@]}" -m verl.trainer.main_ppo \
     algorithm.adv_estimator="${ADV_ESTIMATOR}" \
     data.train_files="${TRAIN_FILES}" \
     data.val_files="${VAL_FILES}" \
@@ -118,6 +137,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.policy_loss.loss_mode="${LOSS_MODE}" \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${train_traj_micro_bsz_per_gpu} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.name="${ENGINE}" \
     actor_rollout_ref.rollout.mode="${ROLLOUT_MODE}" \
     actor_rollout_ref.rollout.load_format=${LOAD_FORMAT} \
@@ -125,6 +145,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.skip_tokenizer_init="${SKIP_TOKENIZER_INIT}" \
     actor_rollout_ref.rollout.gpu_memory_utilization="${GPU_MEMORY_UTILIZATION}" \
     actor_rollout_ref.rollout.enable_chunked_prefill="${ENABLE_CHUNKED_PREFILL}" \
+    actor_rollout_ref.rollout.max_model_len="${MAX_MODEL_LEN}" \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${train_traj_micro_bsz_per_gpu} \
     actor_rollout_ref.ref.fsdp_config.param_offload="${REF_FSDP_PARAM_OFFLOAD}" \
     critic.optim.lr=1e-5 \
@@ -132,10 +153,10 @@ python3 -m verl.trainer.main_ppo \
     critic.model.path="${MODEL_PATH}" \
     critic.model.enable_gradient_checkpointing=False \
     critic.ppo_micro_batch_size_per_gpu=${train_traj_micro_bsz_per_gpu} \
-    critic.model.fsdp_config.param_offload=False \
-    critic.model.fsdp_config.optimizer_offload=False \
-    custom_reward_function.path="${reward_fn_file_path}"\
-    custom_reward_function.name="${reward_fn_name}"\
+    critic.fsdp.param_offload=True \
+    critic.fsdp.optimizer_offload=True \
+    reward.custom_reward_function.path="${reward_fn_file_path}"\
+    reward.custom_reward_function.name="${reward_fn_name}"\
     algorithm.use_kl_in_reward="${USE_KL}" \
     algorithm.kl_penalty=kl \
     algorithm.kl_ctrl.kl_coef=0.001 \
@@ -151,11 +172,11 @@ python3 -m verl.trainer.main_ppo \
     trainer.resume_mode="${RESUME_MODE}" \
     trainer.total_epochs=2 \
     trainer.device=cuda \
-    trainer.total_training_steps="${TOTAL_TRAIN_STEPS}" $@ \
+    trainer.total_training_steps="${TOTAL_TRAIN_STEPS}" "${RAY[@]}" $@ \
     | tee "${output_file}"
 
 if [ "${CUSTOM_REWARD_FN}" = "True" ]; then
-    python3 tests/special_e2e/check_custom_rwd_fn.py --output_file="${output_file}"
+    "${LAUNCH[@]}" tests/special_e2e/check_custom_rwd_fn.py --output_file="${output_file}"
     check_exit_code=$?
     rm -rf "${reward_fn_file_path}"
     rm -rf "${output_file}"

@@ -1,0 +1,35 @@
+# 独立于历史SFT配置；运行前填写本轮专用服务地址与run_id。
+run_id: ???
+student_url: ???
+student_logit_processor_file: ???
+# 204教师通过SSH端口转发连接，不对公网发布评分服务。
+teacher_url: http://127.0.0.1:18081
+# start_opd_teacher_204_tunnel.sh forwards this port to 47.103.58.204:127.0.0.1:18082.
+sglang_version: 0.5.21
+student_served_model_name: add4-opd-student
+student_model_type: qwen3_5
+teacher_served_model_name: Qwen3.8-Flash-Next
+teacher_weight_version: qwen38-frozen
+sync_dir: /data/zengjiajie/projects/verl/add4-opd/student-weight-sync
+audit_dir: /data/zengjiajie/projects/verl/add4-opd/audit
+valid_vocab_size: 248077
+output_vocab_size: 248320
+context_length: 262144
+max_new_tokens: 8192
+temperature: 0.6
+# Exact reverse KL over all 248077 defined tokens; no support truncation.
+# Sampling temperature above is independent of the raw distributions in this loss.
+loss_type: full_vocab_reverse_kl
+teacher_top_k: null
+topk_renormalize: false
+tail_bucket: false
+distillation_temperature: 1.0
+entropy_coef: 0.005
+head_chunk_size: 8
+export_shard_bytes: 1073741824
+max_concurrency: 1
+http_timeout: 600
+seed: 42
+
+teacher_score_chunk_size: 8
+full_score_dir: /data/zengjiajie/projects/verl/add4-opd/full-score-cache

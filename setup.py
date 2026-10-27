@@ -29,7 +29,7 @@ install_requires = [
     "datasets",
     "dill",
     "hydra-core",
-    "numpy<2.0.0",
+    "numpy>=2.0.0",
     "pandas",
     "peft",
     "pyarrow>=19.0.0",
@@ -38,25 +38,29 @@ install_requires = [
     "ray[default]>=2.41.0",
     "torchdata",
     "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
-    "transformers",
+    # 5.6.0 ships a broken flash-attention path (crashes on s_aux=None for
+    # sink-less models); fixed in 5.6.1. See huggingface/transformers#45588.
+    "transformers>=5.5.3,!=5.6.0,<5.13",
     "wandb",
     "packaging>=20.0",
     "tensorboard",
 ]
 
-TEST_REQUIRES = ["pytest", "pre-commit", "py-spy", "pytest-asyncio"]
-PRIME_REQUIRES = ["pyext"]
+TEST_REQUIRES = ["pytest", "pre-commit", "py-spy", "pytest-asyncio", "pytest-rerunfailures"]
+# Empty since PRIME code scoring dropped `pyext`; kept so `verl[prime]` stays installable.
+PRIME_REQUIRES = []
 GEO_REQUIRES = ["mathruler", "torchvision", "qwen_vl_utils"]
-GPU_REQUIRES = ["liger-kernel", "flash-attn"]
+GPU_REQUIRES = ["liger-kernel>=0.8.2", "flash-attn"]
 MATH_REQUIRES = ["math-verify"]  # Add math-verify as an optional dependency
-VLLM_REQUIRES = ["tensordict>=0.8.0,<=0.10.0,!=0.9.0", "vllm>=0.7.3,<=0.9.1"]
+VLLM_REQUIRES = ["tensordict>=0.8.0,<=0.10.0,!=0.9.0", "vllm>=0.18.0"]
+TRTLLM_REQUIRES = ["tensorrt-llm>=1.2.0rc6"]
 SGLANG_REQUIRES = [
     "tensordict>=0.8.0,<=0.10.0,!=0.9.0",
-    "sglang[srt,openai]==0.5.2",
-    "torch==2.8.0",
+    "sglang[srt,openai]==0.5.8",
+    "torch==2.9.1",
 ]
 TRL_REQUIRES = ["trl<=0.9.6"]
-MCORE_REQUIRES = ["mbridge"]
+MCORE_REQUIRES = ["megatron-bridge"]
 
 extras_require = {
     "test": TEST_REQUIRES,
@@ -68,6 +72,7 @@ extras_require = {
     "sglang": SGLANG_REQUIRES,
     "trl": TRL_REQUIRES,
     "mcore": MCORE_REQUIRES,
+    "trtllm": TRTLLM_REQUIRES,
 }
 
 
@@ -79,7 +84,7 @@ setup(
     version=__version__,
     package_dir={"": "."},
     packages=find_packages(where="."),
-    url="https://github.com/volcengine/verl",
+    url="https://github.com/verl-project/verl",
     license="Apache 2.0",
     author="Bytedance - Seed - MLSys",
     author_email="zhangchi.usc1992@bytedance.com, gmsheng@connect.hku.hk",
@@ -88,7 +93,11 @@ setup(
     extras_require=extras_require,
     package_data={
         "": ["version/*"],
-        "verl": ["trainer/config/*.yaml"],
+        "verl": [
+            "trainer/config/*.yaml",
+            "trainer/config/*/*.yaml",
+            "experimental/*/config/*.yaml",
+        ],
     },
     include_package_data=True,
     long_description=long_description,

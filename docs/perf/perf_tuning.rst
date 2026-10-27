@@ -21,12 +21,14 @@ In this section, we will discuss how to tune the performance of all the stages i
 
 7. Forward prefetch in FSDP training backend
 
-8. Memory optimization for entropy calculation from logits
+8. Reduce FSDP gradient synchronization during gradient accumulation
+
+9. Memory optimization for entropy calculation from logits
 
 Rollout Generation Tuning
 --------------------------
 
-verl currently supports two rollout backends: vLLM and TGI (with SGLang support coming soon). 
+verl supports rollout backends including vLLM, SGLang, and TensorRT-LLM.
 
 Below are key factors for tuning vLLM-based rollout. Before tuning, we recommend setting ``actor_rollout_ref.rollout.disable_log_stats=False`` so that rollout statistics are logged.
 
@@ -58,28 +60,30 @@ Below are key factors for tuning vLLM-based rollout. Before tuning, we recommend
   Must to set ``enforce_eager=False`` to use ``cudagraph_capture_sizes``.
 
 More tuning details such as dealing with Preemption and Chunked-prefill
-can be found in `vLLM official tuning guide <https://docs.vllm.ai/en/latest/performance/optimization.html>`_ 
+can be found in `vLLM official tuning guide <https://docs.vllm.ai/en/latest/configuration/optimization/>`_ 
 
-For optimal performance, we recommend using vLLM v0.8.3 or later. See https://github.com/volcengine/verl/blob/main/docs/README_vllm0.8.md for details.
+For optimal performance, we recommend using vLLM v0.8.3 or later. See https://github.com/verl-project/verl/blob/main/docs/README_vllm0.8.md for details.
 
 Enable remove padding (sequence packing)
 -----------------------------------------
 
-Currently, for llama, mistral, gemma1 and qwen based models, users can enable `use_remove_padding=True` to utilize the 
-sequence packing implementation provided by transformers library.
+For FSDP training, set ``actor_rollout_ref.model.use_remove_padding=True`` to
+remove padding tokens before the model forward pass. If the run uses a critic,
+set ``critic.model.use_remove_padding=True`` as well. The benefit depends on
+how much padding is present in the training batches.
 
-For other models, transformers library may also support it but we haven't tested it yet.
-Users can add the desired model config to the  `test_transformer.py <https://github.com/volcengine/verl/blob/main/tests/models/test_transformer.py#L24>`_ file.
-And test its functionality by running the following command:
+For an architecture not covered by
+`tests/models/test_transformer.py <https://github.com/verl-project/verl/blob/main/tests/models/test_transformer.py>`_,
+add a small configuration to its ``test_configs`` list and run the padded versus
+unpadded forward-output comparison on a CUDA or NPU device:
 
 .. code-block:: bash
 
-  pytest -s tests/models/test_transformer.py
+   pytest -s tests/models/test_transformer.py
 
-If the test passes, you can add your desired model into the model `registry.py <https://github.com/volcengine/verl/blob/main/verl/models/registry.py#L24>`_ file.
-Then, you can enjoy the performance boost of sequence packing
-and welcome to PR your tested model to verl!
-
+This test provides an initial numerical comparison. Before adopting the
+setting, run a short training job with the intended configuration and compare
+throughput and peak memory against the padded path.
 
 Batch Size Tuning
 -----------------
@@ -90,10 +94,10 @@ users may need to tune the ``*micro_batch_size_per_gpu`` for different computati
 In verl, the core principle for setting batch sizes is:
 
 - **Algorithmic metrics** (train batch size, PPO mini-batch size) are *global* (from a single-controller perspective), 
-  normalized in each worker. See the `normalization code <https://github.com/volcengine/verl/blob/main/verl/workers/fsdp_workers.py#L120-L122>`_.
+  normalized in each worker. See the `normalization code <https://github.com/verl-project/verl/blob/main/verl/workers/engine_workers.py>`_.
 
 - **Performance-related parameters** (micro batch size, max token length for dynamic batch size) are *local* parameters that define the per-GPU data allocations. 
-  See the `normalization code <https://github.com/volcengine/verl/blob/main/verl/workers/fsdp_workers.py#L127>`_.
+  See the `normalization code <https://github.com/verl-project/verl/blob/main/verl/workers/engine_workers.py>`_.
 
 .. note:: In your training script, please use ``*micro_batch_size_per_gpu`` instead of ``*micro_batch_size``. 
   So that you don't need to consider the normalization of the ``micro_batch_size`` and ``micro_batch_size`` will be deprecated.
@@ -121,6 +125,16 @@ Therefore, users may need to tune the ``*micro_batch_size_per_gpu`` to accelerat
    Set ``actor_rollout_ref.model.enable_activation_offload=True`` and ``critic.model.enable_activation_offload=True``.
    This often works together with gradient checkpointing to get larger micro-batch sizes and it's only available in FSDP backend now.
 
+   The VeOmni backend does not support this synchronous mode and rejects the flag; use
+   ``actor_rollout_ref.actor.veomni.enable_async_activation_offload=True`` instead, which overlaps
+   the device-to-host and host-to-device copies with compute rather than blocking on them.
+   By default the offloaded modules are discovered from the model's
+   ``_no_split_modules``; override that with
+   ``actor_rollout_ref.actor.veomni.activation_offload_modules=[model.layers.{*}]`` when the model
+   does not declare them or when only part of the stack should be offloaded. Free pinned-host
+   buffers are capped by ``actor_rollout_ref.actor.veomni.activation_offload_host_cache_limit_gb``
+   (default 4.0 GB).
+
 Tuning for Dynamic Batch Size
 -----------------------------
 
@@ -146,15 +160,15 @@ Dynamic Batch Size Tuning tips
 Here're some tips to tune the above parameters:
 
 1. **Increase** ``actor_rollout_ref.actor.ppo_max_token_len_per_gpu``  
-   Make it at least 2 x (max_prompt_length + max_response_length). We set it to 3x in `run_qwen2-7b_rm_seq_balance.sh <https://github.com/volcengine/verl/blob/main/examples/ppo_trainer/run_qwen2-7b_rm_seq_balance.sh#L25>`_.
+   Make it at least 2 x (max_prompt_length + max_response_length). See `run_qwen3_8b_fsdp.sh <https://github.com/verl-project/verl/blob/main/examples/ppo_trainer/run_qwen3_8b_fsdp.sh>`_ for an example.
    Try to increase it to get higher throughput.
 
 2. **Forward-only parameters can be larger**: 
    Similar to the non-dynamic-batch scenario, forward-only token limits can exceed those used in forward/backward operations.
  
 3. **Use larger limits for Critic and Reward models**:
-   Critic and Reward parameters can be set at least 2× the Actor’s limits. For instance, we set them to 4× here:  
-   `run_qwen2-7b_rm_seq_balance.sh <https://github.com/volcengine/verl/blob/main/examples/ppo_trainer/run_qwen2-7b_rm_seq_balance.sh#L40>`_
+   Critic and Reward parameters can be set at least 2× the Actor’s limits. See  
+   `run_qwen3_8b_fsdp.sh <https://github.com/verl-project/verl/blob/main/examples/ppo_trainer/run_qwen3_8b_fsdp.sh>`_ for an example.
    
 .. :math:`\text{critic.ppo_max_token_len_per_gpu}  = 2 \times  \text{actor.ppo_max_token_len_per_gpu})`.
 
@@ -167,21 +181,21 @@ We support different model utilize different ulysses_sequence_parallel_size size
 
 To train long sequence (>32k), users may need to decrease the ``*micro_batch_size_per_gpu`` and ``*max_token_len_per_gpu`` to avoid OOM.
 
-LigerKernel for SFT
-----------------------
+LigerKernel for training performance
+--------------------------------------
 
-LigerKernel is a high-performance kernel for Supervised Fine-Tuning (SFT) that can improve training efficiency. To enable LigerKernel in your SFT training:
+LigerKernel provides fused Triton kernels (RMSNorm, SwiGLU, RoPE) that can improve training throughput. It works with both SFT and RL (PPO/GRPO) training, including vision-language models.
 
-1. Install liger-kernel via ``pip3 install liger-kernel``. In your SFT configuration file (e.g., ``verl/trainer/config/sft_trainer.yaml``), set the ``use_liger`` parameter:
+1. Install Liger Kernel 0.8.2 or newer via ``pip3 install "liger-kernel>=0.8.2"``. Set ``use_liger`` in your configuration:
 
    .. code-block:: yaml
 
       model:
-        use_liger: True  # Enable LigerKernel for SFT
+        use_liger: True  # Enable LigerKernel
 
-2. The default value is ``False``. Enable it only when you want to use LigerKernel's optimizations.
+2. The default value is ``False``. When enabled, verl applies Liger's fused RMSNorm, SwiGLU, and RoPE kernels to the model. The model-level ``fused_linear_cross_entropy`` patch remains disabled because verl computes log-probabilities through its output-head path.
 
-3. LigerKernel is particularly useful for improving training performance in SFT scenarios.
+3. ``use_liger`` is compatible with ``use_fused_kernels``. The former controls model-internal kernels, while the latter controls the output head. Set ``fused_kernel_options.impl_backend`` to ``liger`` to use Liger's fused scaled cross entropy, or keep the default ``torch`` backend to use verl's native chunked ``FusedLinearForPPOFunction``. The ``liger`` backend falls back to the native implementation when Liger is not installed.
 
 Forward prefetch in FSDP training backend
 ----------------------
@@ -190,6 +204,30 @@ During the training phase, users can enable forward prefetching in FSDP by setti
 
 .. note::
     Backward prefetch is unsupported because the ``BACKWARD_POST`` policy may prefetch incorrectly in nested-module cases. For details, see the `FSDP documentation <https://github.com/pytorch/torchtitan/blob/main/docs/fsdp.md?plain=1#L70>`_
+
+Reduce FSDP gradient synchronization during gradient accumulation
+------------------------------------------------------------------
+
+When a PPO mini-batch is split into multiple micro-batches, the optimizer only
+steps after the final micro-batch, so gradients only need to be synchronized
+once per mini-batch. By default, the FSDP engine defers gradient synchronization
+on the non-final micro-batches and synchronizes only before the final backward.
+This applies to both the actor and the critic.
+
+With :math:`M` micro-batches per mini-batch, this reduces gradient
+synchronization from :math:`M` rounds to one round. It does not remove parameter
+all-gathers. The optimization is implemented for both FSDP1 (using ``no_sync``)
+and FSDP2 (using ``set_requires_gradient_sync``), and the optimizer update is
+numerically identical to synchronizing every micro-batch.
+
+.. note::
+    Deferring synchronization retains unsharded gradients until the final
+    micro-batch, which can substantially increase peak device memory during
+    gradient accumulation for large models or long packed sequences. Set
+    ``actor_rollout_ref.actor.fsdp_config.use_no_sync_for_gradient_accumulation=False``
+    (or the corresponding critic FSDP setting) to synchronize and reshard after
+    every micro-batch when memory headroom is limited. Forward-only passes are
+    unaffected.
 
 Migrating to FSDP2
 ----------------------

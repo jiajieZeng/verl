@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["CheckpointConfig", "ProfileConfig", "BaseModelConfig"]
+__all__ = ["CheckpointConfig", "ProfileConfig", "HybridRolloutSwitchConfig", "BaseModelConfig"]
 
 
 @dataclass
@@ -26,16 +26,27 @@ class CheckpointConfig(BaseConfig):
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
+    Keep this base class limited to fields every backend understands.
+
     Args:
         save_contents (list[str]): What to include in saved checkpoints.
             Options: 'model', 'optimizer', 'extra', 'hf_model'.
         load_contents (list[str]): Contents to load from checkpoint. Defaults to same as save_contents.
         async_save (bool): Whether to save checkpoints asynchronously. Only implemented for Megatron as of now.
+        strict (bool): Whether to perform strict validation during weight export
+        save_lora_only (bool): When True and the model has LoRA adapters, only
+            save LoRA adapter weights instead of the full model state dict.
+            Dramatically reduces checkpoint size (e.g. ~150 MiB vs ~54 GiB for a
+            27B model). Loaded LoRA-only checkpoints are auto-detected and merged
+            into the current model state. Has no effect when the model has no LoRA
+            adapters.
     """
 
     save_contents: list[str] = field(default_factory=lambda: ["model", "optimizer", "extra"])
     load_contents: list[str] = field(default_factory=lambda: ["model", "optimizer", "extra"])
     async_save: bool = False
+    strict: bool = True
+    save_lora_only: bool = False
 
 
 @dataclass
@@ -58,6 +69,25 @@ class ProfileConfig(BaseConfig):
 
 
 @dataclass
+class HybridRolloutSwitchConfig(BaseConfig):
+    """Configuration for lending idle trainer GPUs to rollout between training steps."""
+
+    enable_switch: bool = False
+    switch_threshold_ratio: float = 0.4
+    adaptive_switch_threshold: bool = True
+    switch_threshold_step_up: float = 0.05
+    switch_threshold_step_down: float = 0.03
+    switch_threshold_release_steps: int = 2
+    switch_cost_window_size: int = 3
+
+    def __post_init__(self):
+        if not 0.0 < self.switch_threshold_ratio <= 1.0:
+            raise ValueError(f"switch_threshold_ratio must be in (0, 1], got {self.switch_threshold_ratio}")
+        if self.switch_cost_window_size <= 0:
+            raise ValueError("switch_cost_window_size must be positive")
+
+
+@dataclass
 class BaseModelConfig(BaseConfig):
     """Base configuration for a model.
     Contains core settings for loading and initializing a pretrained model checkpoint.
@@ -68,6 +98,7 @@ class BaseModelConfig(BaseConfig):
         override_config (dict): Hugging Face config override.
         external_lib (Optional[str]): External model implementation (optional).
         trust_remote_code (bool): Whether to trust remote code from Hugging Face models.
+        lora (dict[str, Any]): LoRA configuration dictionary.
     """
 
     path: str = "~/models/deepseek-llm-7b-chat"
@@ -75,3 +106,19 @@ class BaseModelConfig(BaseConfig):
     override_config: dict[str, Any] = field(default_factory=dict)
     external_lib: Optional[str] = None
     trust_remote_code: bool = False
+    lora: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ModuleConfig(BaseConfig):
+    """Configuration for external Python module, which can be loaded, executed (and optionally, ``import``ed).
+
+    Args:
+        path (str, optional): Path to the module file to load and execute.
+        name (str, optional): Name of the module to ``import``. Format: ``"import.path.to.module"``.
+            If ``None``, the module will be loaded with a hased name and
+                will not be added to ``sys.modules``, thus can not be ``import``ed as ``name``.
+    """
+
+    path: Optional[str] = None
+    name: Optional[str] = None

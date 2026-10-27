@@ -24,6 +24,7 @@ def default_compute_score(
     sandbox_fusion_url=None,
     concurrent_semaphore=None,
     memory_limit_mb=None,
+    **kwargs,
 ):
     """Compute the score for a given solution based on the data source.
 
@@ -129,6 +130,11 @@ def _default_compute_score(
     return default_compute_score(
         data_source, solution_str, ground_truth, extra_info, sandbox_fusion_url, concurrent_semaphore, memory_limit_mb
     )
+
+
+def get_default_compute_score(reward_name: str | None):
+    """Get the default compute_score function based on the reward manager type."""
+    return default_compute_score
 
 
 __all__ = ["default_compute_score"]

@@ -38,13 +38,18 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from verl.utils.device import get_device_capability, get_device_name, is_cuda_available
+
 try:
     import triton
     import triton.language as tl
 
     HAVE_TRITON = True
+    SUPPORT_CUDA_TMA = is_cuda_available and get_device_capability()[0] >= 9 and hasattr(tl, "make_tensor_descriptor")
+
 except ImportError:
     HAVE_TRITON = False
+    SUPPORT_CUDA_TMA = False
 
 from verl.utils.device import get_torch_device
 
@@ -67,6 +72,31 @@ if not HAVE_TRITON:
     triton.jit = null_decorator
     triton.autotune = null_decorator
     tl = MagicMock()
+
+elif SUPPORT_CUDA_TMA:
+    # TMA descriptors require a global memory allocation
+    def alloc_fn(size: int, alignment: int, stream: typing.Optional[int]):
+        return torch.empty(size, device=get_device_name(), dtype=torch.int8)
+
+    # https://github.com/triton-lang/triton/commit/43625fc968b693ab51884ca95adbcf3e43483fd0
+    # Triton 3.5.0 stores allocators in ContextVar; values do not propagate to new
+    # threads by default. Some execution paths in verl use thread pools (e.g.,
+    # concurrent.futures), so we set a ContextVar *default* to avoid falling
+    # back to NullAllocator in worker threads.
+    try:
+        import contextvars
+
+        import triton.runtime._allocation as _triton_allocation
+
+        if isinstance(getattr(_triton_allocation, "_allocator", None), contextvars.ContextVar):
+            _triton_allocation._allocator = contextvars.ContextVar(
+                _triton_allocation._allocator.name,
+                default=alloc_fn,
+            )
+    except (ImportError, AttributeError):
+        pass
+
+    triton.set_allocator(alloc_fn)
 
 
 @dataclass
@@ -150,6 +180,9 @@ def set_backward_method(backward_method: BackwardEnum):
     _config._backward = backward_method
 
 
+# The inner strides are deliberately left unannotated so that Triton specializes them to 1 and can prove
+# contiguity (an annotated int argument is never specialized). The outer strides keep `tl.int64` for 64-bit
+# address arithmetic.
 @triton.autotune(
     configs=[triton.Config({"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 32}, num_stages=3, num_warps=8)],
     key=["num_tokens", "hidden_size", "vocab_size"],
@@ -165,26 +198,27 @@ def efficient_entropy_kernel_general_mainloop(
     vocab_size,
     vocab_per_split,
     stride_hidden_m: tl.int64,
-    stride_hidden_k: tl.int64,
+    stride_hidden_k,
     stride_weight_n: tl.int64,
-    stride_weight_k: tl.int64,
+    stride_weight_k,
     max_ptr,
     stride_max_m: tl.int64,
-    stride_max_n: tl.int64,
+    stride_max_n,
     accu_ptr,
     stride_accu_m: tl.int64,
-    stride_accu_n: tl.int64,
+    stride_accu_n,
     entropy_b_ptr,
     stride_entropy_b_m: tl.int64,
-    stride_entropy_b_n: tl.int64,
+    stride_entropy_b_n,
     global_logprobs_ptr,
-    stride_global_logprobs: tl.int64,
+    stride_global_logprobs,
     global_logprobs_scalar_ptr,
     rcp_temperature: tl.float32,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
+    USE_TMA: tl.constexpr,
 ):
     """
     forward mainloop
@@ -200,9 +234,28 @@ def efficient_entropy_kernel_general_mainloop(
         tl.store(global_logprobs_scalar_ptr, 0.0)
 
     # create pointers for the first blocks of hidden
-    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    start_offs_am = pid_m * BLOCK_SIZE_M
+    offs_am = start_offs_am + tl.arange(0, BLOCK_SIZE_M)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    hidden_ptrs = hidden_ptr + (offs_am[:, None] * stride_hidden_m + offs_k[None, :] * stride_hidden_k)
+
+    if USE_TMA:
+        # using TMA and device-side descriptor creation
+        hidden_desc = tl.make_tensor_descriptor(
+            hidden_ptr,
+            shape=[num_tokens, hidden_size],
+            strides=[stride_hidden_m, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+        )
+
+        weight_desc = tl.make_tensor_descriptor(
+            weight_ptr,
+            shape=[vocab_size, hidden_size],
+            strides=[stride_weight_n, 1],
+            block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+        )
+
+    else:
+        hidden_ptrs = hidden_ptr + (offs_am[:, None] * stride_hidden_m + offs_k[None, :] * stride_hidden_k)
 
     # load labels for this block
     labels = tl.load(labels_ptr + offs_am, mask=offs_am < num_tokens)
@@ -213,50 +266,60 @@ def efficient_entropy_kernel_general_mainloop(
     _accu = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
     _entropy_b = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
     _logprobs = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+    vocab_bound = min((pid_n + 1) * vocab_per_split, vocab_size)
     for n in range(0, num_pid_n):
-        offs_bn = pid_n * vocab_per_split + n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-        # weight_ptrs = weight_ptr + (offs_k[:, None] * stride_weight_k + offs_bn[None, :] * stride_weight_n)
-        weight_ptrs = weight_ptr + (offs_bn[:, None] * stride_weight_n + offs_k[None, :] * stride_weight_k)
+        start_offs_bn = pid_n * vocab_per_split + n * BLOCK_SIZE_N
+        offs_bn = start_offs_bn + tl.arange(0, BLOCK_SIZE_N)
+
+        logits = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        if not USE_TMA:
+            # weight_ptrs = weight_ptr + (offs_k[:, None] * stride_weight_k + offs_bn[None, :] * stride_weight_n)
+            weight_ptrs = weight_ptr + (offs_bn[:, None] * stride_weight_n + offs_k[None, :] * stride_weight_k)
 
         # iterate over K dimension
-        logits = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         for k in range(0, tl.cdiv(hidden_size, BLOCK_SIZE_K)):
-            # load the next block of hidden and weight
-            _hidden = tl.load(
-                hidden_ptrs,
-                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_am[:, None] < num_tokens),
-                other=0.0,
-            )
-            # _weight = tl.load(weight_ptrs,
-            #                   mask=(offs_k[:, None] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[None, :] < (min(
-            #                       (pid_n + 1) * vocab_per_split, vocab_size))),
-            #                   other=0.0)
+            if USE_TMA:
+                # load the next block of hidden and weight
+                start_offs_k = k * BLOCK_SIZE_K
+                _hidden = hidden_desc.load([start_offs_am, start_offs_k])
+                _weight = weight_desc.load([start_offs_bn, start_offs_k])
+            else:
+                # load the next block of hidden and weight
+                _hidden = tl.load(
+                    hidden_ptrs,
+                    mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_am[:, None] < num_tokens),
+                    other=0.0,
+                )
 
-            _weight = tl.load(
-                weight_ptrs,
-                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K)
-                & (offs_bn[:, None] < (min((pid_n + 1) * vocab_per_split, vocab_size))),
-                other=0.0,
-            )
+                _weight = tl.load(
+                    weight_ptrs,
+                    mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K)
+                    & (offs_bn[:, None] < (min((pid_n + 1) * vocab_per_split, vocab_size))),
+                    other=0.0,
+                )
+
+                # advance the ptrs to the next K block
+                hidden_ptrs += BLOCK_SIZE_K * stride_hidden_k
+                weight_ptrs += BLOCK_SIZE_K * stride_weight_k
 
             # GEMM
             logits = tl.dot(_hidden, _weight.trans(), logits)
 
-            # advance the ptrs to the next K block
-            hidden_ptrs += BLOCK_SIZE_K * stride_hidden_k
-            weight_ptrs += BLOCK_SIZE_K * stride_weight_k
-        # reset hidden_ptrs for next iteration
-        hidden_ptrs -= hidden_size * stride_hidden_k
+        if not USE_TMA:
+            # reset hidden_ptrs for next iteration
+            hidden_ptrs -= hidden_size * stride_hidden_k
 
         # scale logits by temperature
         logits *= rcp_temperature
 
+        logits_for_lse = tl.where(offs_bn[None, :] < vocab_bound, logits, float("-inf"))
+
         # update global maximum
         _max_old = _max
-        m_pid_n = tl.max(logits, axis=1)
+        m_pid_n = tl.max(logits_for_lse, axis=1)
         _max = tl.maximum(_max_old, m_pid_n)
 
-        exp_logits = tl.exp(logits - _max[:, None])
+        exp_logits = tl.exp(logits_for_lse - _max[:, None])
         coeff = tl.exp(_max_old - _max)
         _accu = coeff * _accu + tl.sum(exp_logits, axis=1)
 
@@ -276,7 +339,6 @@ def efficient_entropy_kernel_general_mainloop(
     tl.store(accu_ptrs, _accu, mask=(offs_max_m < num_tokens) & (offs_max_n[None] < num_splits))
     entropy_b_ptrs = entropy_b_ptr + offs_max_n * stride_entropy_b_n + offs_max_m * stride_entropy_b_m
     tl.store(entropy_b_ptrs, _entropy_b, mask=(offs_max_m < num_tokens) & (offs_max_n < num_splits))
-
     # store logprobs
     vocab_left_idx = pid_n * vocab_per_split + rank * vocab_size
     vocab_right_idx = min((pid_n + 1) * vocab_per_split, vocab_size) + rank * vocab_size
@@ -292,25 +354,25 @@ def efficient_entropy_kernel_general_mainloop(
 def efficient_entropy_triton_kernel_epilogue(
     max_ptr,
     stride_max_m: tl.int64,
-    stride_max_n: tl.int64,
+    stride_max_n,
     num_tokens,
     num_splits,
     global_max_ptr,
-    stride_global_max: tl.int64,
+    stride_global_max,
     accu_ptr,
     stride_accu_m: tl.int64,
-    stride_accu_n: tl.int64,
+    stride_accu_n,
     global_accu_ptr,
-    stride_global_accu: tl.int64,
+    stride_global_accu,
     entropy_b_ptr,
     stride_entropy_b_m: tl.int64,
-    stride_entropy_b_n: tl.int64,
+    stride_entropy_b_n,
     global_entropy_b_ptr,
-    stride_global_entropy_b: tl.int64,
+    stride_global_entropy_b,
     global_entropy_ptr,
-    stride_global_entropy: tl.int64,
+    stride_global_entropy,
     global_logprobs_ptr,
-    stride_global_logprobs: tl.int64,
+    stride_global_logprobs,
     global_logprobs_scalar_ptr,
     reduction: int,
     BLOCK_SIZE_M: tl.constexpr,
@@ -386,22 +448,22 @@ def efficient_entropy_triton_kernel_epilogue_tp(
     num_splits,
     reduced_max_ptr,
     stride_reduced_max_m: tl.int64,
-    stride_reduced_max_n: tl.int64,
+    stride_reduced_max_n,
     original_max_ptr,
     stride_original_max_m: tl.int64,
-    stride_original_max_n: tl.int64,
+    stride_original_max_n,
     accu_ptr,
     stride_accu_m: tl.int64,
-    stride_accu_n: tl.int64,
+    stride_accu_n,
     entropy_b_ptr,
     stride_entropy_b_m: tl.int64,
-    stride_entropy_b_n: tl.int64,
+    stride_entropy_b_n,
     global_max_ptr,
-    stride_global_max: tl.int64,
+    stride_global_max,
     global_accu_ptr,
-    stride_global_accu: tl.int64,
+    stride_global_accu,
     global_entropy_b_ptr,
-    stride_global_entropy_b: tl.int64,
+    stride_global_entropy_b,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
@@ -460,15 +522,15 @@ def efficient_entropy_triton_kernel_epilogue_tp(
 def efficient_entropy_triton_epilogue_tp_update(
     num_tokens,
     logprobs_ptr,
-    stride_logprobs: tl.int64,
+    stride_logprobs,
     maximum_ptr,
-    stride_maximum: tl.int64,
+    stride_maximum,
     accumulate_ptr,
-    stride_accumulate: tl.int64,
+    stride_accumulate,
     entropy_b_ptr,
-    stride_entropy_b: tl.int64,
+    stride_entropy_b,
     entropy_ptr,
-    stride_entropy: tl.int64,
+    stride_entropy,
     logprobs_scalar_ptr,
     reduction: int,
     BLOCK_SIZE_M: tl.constexpr,
@@ -605,6 +667,7 @@ def efficient_entropy_forward(
             _logprobs.stride(0),
             logprobs,
             1.0 / temperature,
+            USE_TMA=SUPPORT_CUDA_TMA and hidden.stride(1) == 1 and weight.stride(1) == 1,
         )
     else:
         raise AssertionError("Triton is required for efficient entropy kernel")
@@ -715,34 +778,35 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
     rank: int,
     hidden_ptr,
     stride_hidden_m: tl.int64,
-    stride_hidden_k: tl.int64,
+    stride_hidden_k,
     weight_ptr,
     stride_weight_n: tl.int64,
-    stride_weight_k: tl.int64,
+    stride_weight_k,
     labels_ptr,
-    stride_labels: tl.int64,
+    stride_labels,
     maximum_ptr,
-    stride_maximum: tl.int64,
+    stride_maximum,
     accu_ptr,
-    stride_accu: tl.int64,
+    stride_accu,
     d_entropy_ptr,
-    stride_d_entropy: tl.int64,
+    stride_d_entropy,
     d_logprobs_ptr,
-    stride_d_logprobs: tl.int64,
+    stride_d_logprobs,
     reduction: int,
     entropy_b_ptr,
-    stride_entropy_b: tl.int64,
+    stride_entropy_b,
     d_hidden_ptr,
     stride_d_hidden_m: tl.int64,
-    stride_d_hidden_k: tl.int64,
+    stride_d_hidden_k,
     d_weight_ptr,
     stride_d_weight_n: tl.int64,
-    stride_d_weight_k: tl.int64,
+    stride_d_weight_k,
     rcp_temperature: tl.float32,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    USE_TMA: tl.constexpr,
 ):
     """
     backward mainloop, where d_logits & d_hidden & d_weight are fused
@@ -763,9 +827,26 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    start_offs_am = pid_m * BLOCK_SIZE_M
+    offs_am = start_offs_am + tl.arange(0, BLOCK_SIZE_M)
+    start_offs_bn = pid_n * BLOCK_SIZE_N
+    offs_bn = start_offs_bn + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
+    if USE_TMA:
+        # using TMA and device-side descriptor creation
+        hidden_desc = tl.make_tensor_descriptor(
+            hidden_ptr,
+            shape=[num_tokens, hidden_size],
+            strides=[stride_hidden_m, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+        )
+
+        weight_desc = tl.make_tensor_descriptor(
+            weight_ptr,
+            shape=[vocab_size, hidden_size],
+            strides=[stride_weight_n, 1],
+            block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+        )
 
     maximum_ptrs = maximum_ptr + offs_am * stride_maximum
     maximum = tl.load(maximum_ptrs, mask=offs_am < num_tokens, other=0.0)
@@ -789,9 +870,10 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
     entropy_b_ptrs = entropy_b_ptr + offs_am * stride_entropy_b
     entropy_b = tl.load(entropy_b_ptrs, mask=offs_am < num_tokens, other=0.0)
 
-    hidden_ptrs = hidden_ptr + (offs_am[:, None] * stride_hidden_m + offs_k[None, :] * stride_hidden_k)
-    # weight_ptrs = weight_ptr + (offs_k[:, None] * stride_weight_k + offs_bn[None, :] * stride_weight_n)
-    weight_ptrs = weight_ptr + (offs_bn[:, None] * stride_weight_n + offs_k[None, :] * stride_weight_k)
+    if not USE_TMA:
+        hidden_ptrs = hidden_ptr + (offs_am[:, None] * stride_hidden_m + offs_k[None, :] * stride_hidden_k)
+        # weight_ptrs = weight_ptr + (offs_k[:, None] * stride_weight_k + offs_bn[None, :] * stride_weight_n)
+        weight_ptrs = weight_ptr + (offs_bn[:, None] * stride_weight_n + offs_k[None, :] * stride_weight_k)
     labels_ptrs = labels_ptr + offs_am * stride_labels
     labels = tl.load(labels_ptrs, mask=offs_am < num_tokens, other=0)
 
@@ -801,26 +883,29 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
 
     logits = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(hidden_size, BLOCK_SIZE_K)):
-        _hidden = tl.load(
-            hidden_ptrs,
-            mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_am[:, None] < num_tokens),
-            other=0.0,
-        )
-        # _weight = tl.load(weight_ptrs,
-        #                   mask=(offs_k[:, None] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[None, :] < vocab_size),
-        #                   other=0.0)
-        _weight = tl.load(
-            weight_ptrs,
-            mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[:, None] < vocab_size),
-            other=0.0,
-        )
+        if USE_TMA:
+            start_offs_k = k * BLOCK_SIZE_K
+            _hidden = hidden_desc.load([start_offs_am, start_offs_k])
+            _weight = weight_desc.load([start_offs_bn, start_offs_k])
+        else:
+            _hidden = tl.load(
+                hidden_ptrs,
+                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_am[:, None] < num_tokens),
+                other=0.0,
+            )
+            _weight = tl.load(
+                weight_ptrs,
+                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[:, None] < vocab_size),
+                other=0.0,
+            )
+            hidden_ptrs += BLOCK_SIZE_K * stride_hidden_k
+            weight_ptrs += BLOCK_SIZE_K * stride_weight_k
 
-        logits = tl.dot(_hidden, _weight.trans(), logits)
+        logits = tl.dot(_hidden, _weight.T, logits)
 
-        hidden_ptrs += BLOCK_SIZE_K * stride_hidden_k
-        weight_ptrs += BLOCK_SIZE_K * stride_weight_k
-    hidden_ptrs -= hidden_size * stride_hidden_k
-    weight_ptrs -= hidden_size * stride_weight_k
+    if not USE_TMA:
+        hidden_ptrs -= hidden_size * stride_hidden_k
+        weight_ptrs -= hidden_size * stride_weight_k
 
     # scale logits by temperature
     logits *= rcp_temperature
@@ -836,15 +921,19 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
 
     # loop for d_weight & d_hidden
     for k in range(0, tl.cdiv(hidden_size, BLOCK_SIZE_K)):
-        _hidden = tl.load(
-            hidden_ptrs,
-            mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_am[:, None] < num_tokens),
-            other=0.0,
-        )
-        # _d_weight = tl.dot(tl.trans(_hidden).to(tl.float32), d_logits)
-        # tl.atomic_add(d_weight_ptrs,
-        #               _d_weight,
-        #               mask=(offs_k[:, None] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[None, :] < vocab_size))
+        start_offs_k = k * BLOCK_SIZE_K
+        if USE_TMA:
+            _hidden = hidden_desc.load([start_offs_am, start_offs_k])
+        else:
+            _hidden = tl.load(
+                hidden_ptrs,
+                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_am[:, None] < num_tokens),
+                other=0.0,
+            )
+            # _d_weight = tl.dot(tl.trans(_hidden).to(tl.float32), d_logits)
+            # tl.atomic_add(d_weight_ptrs,
+            #               _d_weight,
+            #               mask=(offs_k[:, None] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[None, :] < vocab_size))
         _d_weight = tl.dot(d_logits.trans(), _hidden.to(tl.float32))
         tl.atomic_add(
             d_weight_ptrs,
@@ -852,15 +941,20 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
             mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[:, None] < vocab_size),
         )
 
-        # _weight = tl.load(weight_ptrs,
-        #                   mask=(offs_k[:, None] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[None, :] < vocab_size),
-        #                   other=0.0)
-        # _d_hidden = tl.dot(d_logits, tl.trans(_weight).to(tl.float32))
-        _weight = tl.load(
-            weight_ptrs,
-            mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[:, None] < vocab_size),
-            other=0.0,
-        )
+        if USE_TMA:
+            _weight = weight_desc.load([start_offs_bn, start_offs_k])
+        else:
+            # _weight = tl.load(
+            #     weight_ptrs,
+            #     mask=(offs_k[:, None] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[None, :] < vocab_size),
+            #     other=0.0
+            # )
+            # _d_hidden = tl.dot(d_logits, tl.trans(_weight).to(tl.float32))
+            _weight = tl.load(
+                weight_ptrs,
+                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[:, None] < vocab_size),
+                other=0.0,
+            )
         _d_hidden = tl.dot(d_logits, _weight.to(tl.float32))
         tl.atomic_add(
             d_hidden_ptrs,
@@ -868,8 +962,9 @@ def efficient_entropy_backward_kernel_general_mainloop_MN(
             mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_am[:, None] < num_tokens),
         )
 
-        hidden_ptrs += BLOCK_SIZE_K * stride_hidden_k
-        weight_ptrs += BLOCK_SIZE_K * stride_weight_k
+        if not USE_TMA:
+            hidden_ptrs += BLOCK_SIZE_K * stride_hidden_k
+            weight_ptrs += BLOCK_SIZE_K * stride_weight_k
         d_hidden_ptrs += BLOCK_SIZE_K * stride_d_hidden_k
         d_weight_ptrs += BLOCK_SIZE_K * stride_d_weight_k
 
@@ -892,26 +987,26 @@ def efficient_entropy_backward_kernel_d_hidden(
     rank: int,
     hidden_ptr,
     stride_hidden_m: tl.int64,
-    stride_hidden_k: tl.int64,
+    stride_hidden_k,
     weight_ptr,
     stride_weight_n: tl.int64,
-    stride_weight_k: tl.int64,
+    stride_weight_k,
     labels_ptr,
-    stride_labels: tl.int64,
+    stride_labels,
     maximum_ptr,
-    stride_maximum: tl.int64,
+    stride_maximum,
     accu_ptr,
-    stride_accu: tl.int64,
+    stride_accu,
     d_entropy_ptr,
-    stride_d_entropy: tl.int64,
+    stride_d_entropy,
     d_logprobs_ptr,
-    stride_d_logprobs: tl.int64,
+    stride_d_logprobs,
     reduction: int,
     entropy_b_ptr,
-    stride_entropy_b: tl.int64,
+    stride_entropy_b,
     d_hidden_ptr,
     stride_d_hidden_m: tl.int64,
-    stride_d_hidden_k: tl.int64,
+    stride_d_hidden_k,
     rcp_temperature: tl.float32,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -1019,26 +1114,26 @@ def efficient_entropy_backward_kernel_d_weight(
     rank: int,
     hidden_ptr,
     stride_hidden_m: tl.int64,
-    stride_hidden_k: tl.int64,
+    stride_hidden_k,
     weight_ptr,
     stride_weight_n: tl.int64,
-    stride_weight_k: tl.int64,
+    stride_weight_k,
     labels_ptr,
-    stride_labels: tl.int64,
+    stride_labels,
     maximum_ptr,
-    stride_maximum: tl.int64,
+    stride_maximum,
     accu_ptr,
-    stride_accu: tl.int64,
+    stride_accu,
     d_entropy_ptr,
-    stride_d_entropy: tl.int64,
+    stride_d_entropy,
     d_logprobs_ptr,
-    stride_d_logprobs: tl.int64,
+    stride_d_logprobs,
     reduction: int,
     entropy_b_ptr,
-    stride_entropy_b: tl.int64,
+    stride_entropy_b,
     d_weight_ptr,
     stride_d_weight_n: tl.int64,
-    stride_d_weight_k: tl.int64,
+    stride_d_weight_k,
     rcp_temperature: tl.float32,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -1139,31 +1234,32 @@ def efficient_entropy_backward_kernel_general_d_logits(
     rank: int,
     hidden_ptr,
     stride_hidden_m: tl.int64,
-    stride_hidden_k: tl.int64,
+    stride_hidden_k,
     weight_ptr,
     stride_weight_n: tl.int64,
-    stride_weight_k: tl.int64,
+    stride_weight_k,
     labels_ptr,
-    stride_labels: tl.int64,
+    stride_labels,
     maximum_ptr,
-    stride_maximum: tl.int64,
+    stride_maximum,
     accu_ptr,
-    stride_accu: tl.int64,
+    stride_accu,
     d_entropy_ptr,
-    stride_d_entropy: tl.int64,
+    stride_d_entropy,
     d_logprobs_ptr,
-    stride_d_logprobs: tl.int64,
+    stride_d_logprobs,
     reduction: int,
     entropy_b_ptr,
     stride_entropy_b,
     d_logits_ptr,
     stride_d_logits_m: tl.int64,
-    stride_d_logits_n: tl.int64,
+    stride_d_logits_n,
     rcp_temperature: tl.float32,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    USE_TMA: tl.constexpr,
 ):
     """
     backward d_logits
@@ -1184,8 +1280,10 @@ def efficient_entropy_backward_kernel_general_d_logits(
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    start_offs_am = pid_m * BLOCK_SIZE_M
+    offs_am = start_offs_am + tl.arange(0, BLOCK_SIZE_M)
+    start_offs_bn = pid_n * BLOCK_SIZE_N
+    offs_bn = start_offs_bn + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     maximum_ptrs = maximum_ptr + offs_am * stride_maximum
@@ -1210,34 +1308,53 @@ def efficient_entropy_backward_kernel_general_d_logits(
     entropy_b_ptrs = entropy_b_ptr + offs_am * stride_entropy_b
     entropy_b = tl.load(entropy_b_ptrs, mask=offs_am < num_tokens, other=0.0)
 
-    hidden_ptrs = hidden_ptr + (offs_am[:, None] * stride_hidden_m + offs_k[None, :] * stride_hidden_k)
-    # weight_ptrs = weight_ptr + (offs_k[:, None] * stride_weight_k + offs_bn[None, :] * stride_weight_n)
-    weight_ptrs = weight_ptr + (offs_bn[:, None] * stride_weight_n + offs_k[None, :] * stride_weight_k)
     labels_ptrs = labels_ptr + offs_am * stride_labels
     labels = tl.load(labels_ptrs, mask=offs_am < num_tokens, other=0)
 
     logits = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    if USE_TMA:
+        # using TMA and device-side descriptor creation
+        hidden_desc = tl.make_tensor_descriptor(
+            hidden_ptr,
+            shape=[num_tokens, hidden_size],
+            strides=[stride_hidden_m, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+        )
+        weight_desc = tl.make_tensor_descriptor(
+            weight_ptr,
+            shape=[vocab_size, hidden_size],
+            strides=[stride_weight_n, 1],
+            block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+        )
+    else:
+        hidden_ptrs = hidden_ptr + (offs_am[:, None] * stride_hidden_m + offs_k[None, :] * stride_hidden_k)
+        # weight_ptrs = weight_ptr + (offs_k[:, None] * stride_weight_k + offs_bn[None, :] * stride_weight_n)
+        weight_ptrs = weight_ptr + (offs_bn[:, None] * stride_weight_n + offs_k[None, :] * stride_weight_k)
+
     for k in range(0, tl.cdiv(hidden_size, BLOCK_SIZE_K)):
-        _hidden = tl.load(
-            hidden_ptrs,
-            mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_am[:, None] < num_tokens),
-            other=0.0,
-        )
-        # _weight = tl.load(weight_ptrs,
-        #                   mask=(offs_k[:, None] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[None, :] < vocab_size),
-        #                   other=0.0)
-        _weight = tl.load(
-            weight_ptrs,
-            mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[:, None] < vocab_size),
-            other=0.0,
-        )
+        if USE_TMA:
+            start_offs_k = k * BLOCK_SIZE_K
+            _hidden = hidden_desc.load([start_offs_am, start_offs_k])
+            _weight = weight_desc.load([start_offs_bn, start_offs_k])
+        else:
+            _hidden = tl.load(
+                hidden_ptrs,
+                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_am[:, None] < num_tokens),
+                other=0.0,
+            )
+            _weight = tl.load(
+                weight_ptrs,
+                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[:, None] < vocab_size),
+                other=0.0,
+            )
+            hidden_ptrs += BLOCK_SIZE_K * stride_hidden_k
+            weight_ptrs += BLOCK_SIZE_K * stride_weight_k
+        logits = tl.dot(_hidden, _weight.T, logits)
 
-        logits = tl.dot(_hidden, _weight.trans(), logits)
-
-        hidden_ptrs += BLOCK_SIZE_K * stride_hidden_k
-        weight_ptrs += BLOCK_SIZE_K * stride_weight_k
-    hidden_ptrs -= hidden_size * stride_hidden_k
-    weight_ptrs -= hidden_size * stride_weight_k
+    if not USE_TMA:
+        hidden_ptrs -= hidden_size * stride_hidden_k
+        weight_ptrs -= hidden_size * stride_weight_k
 
     # scale logits by temperature
     logits *= rcp_temperature
@@ -1280,31 +1397,32 @@ def efficient_entropy_backward_kernel_general_d_logits_split_N(
     rank: int,
     hidden_ptr,
     stride_hidden_m: tl.int64,
-    stride_hidden_k: tl.int64,
+    stride_hidden_k,
     weight_ptr,
     stride_weight_n: tl.int64,
-    stride_weight_k: tl.int64,
+    stride_weight_k,
     labels_ptr,
-    stride_labels: tl.int64,
+    stride_labels,
     maximum_ptr,
-    stride_maximum: tl.int64,
+    stride_maximum,
     accu_ptr,
-    stride_accu: tl.int64,
+    stride_accu,
     d_entropy_ptr,
-    stride_d_entropy: tl.int64,
+    stride_d_entropy,
     d_logprobs_ptr,
-    stride_d_logprobs: tl.int64,
+    stride_d_logprobs,
     reduction: int,
     entropy_b_ptr,
     stride_entropy_b,
     d_logits_ptr,
     stride_d_logits_m: tl.int64,
-    stride_d_logits_n: tl.int64,
+    stride_d_logits_n,
     rcp_temperature: tl.float32,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    USE_TMA: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(num_tokens, BLOCK_SIZE_M)
@@ -1316,8 +1434,10 @@ def efficient_entropy_backward_kernel_general_d_logits_split_N(
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_bn = split_idx * vocab_per_split + pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    start_offs_am = pid_m * BLOCK_SIZE_M
+    offs_am = start_offs_am + tl.arange(0, BLOCK_SIZE_M)
+    start_offs_bn = split_idx * vocab_per_split + pid_n * BLOCK_SIZE_N
+    offs_bn = start_offs_bn + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     maximum = tl.load(maximum_ptr + offs_am * stride_maximum, mask=offs_am < num_tokens, other=0.0)
@@ -1336,26 +1456,46 @@ def efficient_entropy_backward_kernel_general_d_logits_split_N(
     entropy_b = tl.load(entropy_b_ptr + offs_am * stride_entropy_b, mask=offs_am < num_tokens, other=0.0)
     labels = tl.load(labels_ptr + offs_am * stride_labels, mask=offs_am < num_tokens, other=0)
 
-    hidden_ptrs = hidden_ptr + (offs_am[:, None] * stride_hidden_m + offs_k[None, :] * stride_hidden_k)
-    weight_ptrs = weight_ptr + (offs_bn[:, None] * stride_weight_n + offs_k[None, :] * stride_weight_k)
-
-    vocab_right_bound = min((split_idx + 1) * vocab_per_split, vocab_size)
     logits = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(hidden_size, BLOCK_SIZE_K)):
-        _hidden = tl.load(
-            hidden_ptrs,
-            mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_am[:, None] < num_tokens),
-            other=0.0,
-        )
-        _weight = tl.load(
-            weight_ptrs,
-            mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[:, None] < vocab_right_bound),
-            other=0.0,
-        )
-        logits = tl.dot(_hidden, _weight.trans(), logits)
 
-        hidden_ptrs += BLOCK_SIZE_K * stride_hidden_k
-        weight_ptrs += BLOCK_SIZE_K * stride_weight_k
+    if USE_TMA:
+        # using TMA and device-side descriptor creation
+        hidden_desc = tl.make_tensor_descriptor(
+            hidden_ptr,
+            shape=[num_tokens, hidden_size],
+            strides=[stride_hidden_m, 1],
+            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+        )
+        weight_desc = tl.make_tensor_descriptor(
+            weight_ptr,
+            shape=[vocab_size, hidden_size],
+            strides=[stride_weight_n, 1],
+            block_shape=[BLOCK_SIZE_N, BLOCK_SIZE_K],
+        )
+    else:
+        hidden_ptrs = hidden_ptr + (offs_am[:, None] * stride_hidden_m + offs_k[None, :] * stride_hidden_k)
+        weight_ptrs = weight_ptr + (offs_bn[:, None] * stride_weight_n + offs_k[None, :] * stride_weight_k)
+        vocab_right_bound = min((split_idx + 1) * vocab_per_split, vocab_size)
+
+    for k in range(0, tl.cdiv(hidden_size, BLOCK_SIZE_K)):
+        if USE_TMA:
+            start_offs_k = k * BLOCK_SIZE_K
+            _hidden = hidden_desc.load([start_offs_am, start_offs_k])
+            _weight = weight_desc.load([start_offs_bn, start_offs_k])
+        else:
+            _hidden = tl.load(
+                hidden_ptrs,
+                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_am[:, None] < num_tokens),
+                other=0.0,
+            )
+            _weight = tl.load(
+                weight_ptrs,
+                mask=(offs_k[None, :] < hidden_size - k * BLOCK_SIZE_K) & (offs_bn[:, None] < vocab_right_bound),
+                other=0.0,
+            )
+            hidden_ptrs += BLOCK_SIZE_K * stride_hidden_k
+            weight_ptrs += BLOCK_SIZE_K * stride_weight_k
+        logits = tl.dot(_hidden, _weight.T, logits)
 
     logits *= rcp_temperature
     exp_logits = tl.exp(logits - maximum[:, None])
@@ -1475,6 +1615,7 @@ def efficient_entropy_backward(
             d_weight.stride(0),
             d_weight.stride(1),
             1.0 / temperature,
+            USE_TMA=SUPPORT_CUDA_TMA and hidden.stride(1) == 1 and weight.stride(1) == 1,
         )
 
     elif _config._backward == BackwardEnum._Total_Separate:
@@ -1514,6 +1655,7 @@ def efficient_entropy_backward(
                 _d_logits.stride(0),
                 _d_logits.stride(1),
                 1.0 / temperature,
+                USE_TMA=SUPPORT_CUDA_TMA and hidden.stride(1) == 1 and weight.stride(1) == 1,
             )
 
             torch.matmul(_d_logits, weight, out=d_hidden)
@@ -1562,6 +1704,7 @@ def efficient_entropy_backward(
                 _d_logits.stride(0),
                 _d_logits.stride(1),
                 1.0 / temperature,
+                USE_TMA=SUPPORT_CUDA_TMA and hidden.stride(1) == 1 and weight.stride(1) == 1,
             )
 
             if split_idx == (num_splits - 1):
