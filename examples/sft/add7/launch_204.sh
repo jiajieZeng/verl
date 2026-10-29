@@ -76,12 +76,15 @@ args=(--config-path "$entry" --config-name qwen35.8gpu "hydra.run.dir=$run/hydra
 WANDB_MODE=${WANDB_MODE:-online}
 case "$WANDB_MODE" in
   online)
-    [[ -n "${WANDB_API_KEY:-}" ]] || {
-      echo 'WANDB_MODE=online requires WANDB_API_KEY in the host environment; use a protected login/secret, never paste it into the script.' >&2
-      exit 1
-    }
     network=()
-    wandb_env=(-e WANDB_API_KEY)
+    if [[ -n "${WANDB_API_KEY:-}" ]]; then
+      wandb_env=(-e WANDB_API_KEY)
+    elif [[ -r "${HOME}/.netrc" ]]; then
+      wandb_env=(-v "${HOME}/.netrc:/tmp/.netrc:ro")
+    else
+      echo 'WANDB_MODE=online requires a protected WANDB_API_KEY or an existing host wandb login (~/.netrc); never paste a key into the script.' >&2
+      exit 1
+    fi
     ;;
   offline)
     network=(--network none)

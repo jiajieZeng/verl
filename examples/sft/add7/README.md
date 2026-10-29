@@ -36,9 +36,9 @@ cd /data/zengjiajie/projects/verl/verl/examples/sft/add7
 ./launch_204.sh train                 # 正式5 epoch，从 base 开始，绝不自动复用 smoke
 ```
 
-GPU 模式默认使用 W&B online。启动前在 204 宿主机通过受保护的登录脚本或 secret 注入
-`WANDB_API_KEY`，不要把 key 写进本脚本、命令历史、运行目录或聊天；如需指定团队，额外设置
-`WANDB_ENTITY`。启动器只把已有环境变量名传给临时容器，不打印 key。未配置凭据时 online
+GPU 模式默认使用 W&B online。启动前在 204 宿主机完成 `wandb login`（已有的 `~/.netrc`
+会只读挂载给临时容器），或通过受保护的 secret 注入 `WANDB_API_KEY`；不要把 key 写进本脚本、
+命令历史、运行目录或聊天。如需指定团队，额外设置 `WANDB_ENTITY`。启动器不打印 key。未配置凭据时 online
 模式会在申请 GPU 前失败；可显式 `WANDB_MODE=offline ./launch_204.sh smoke` 做离线 smoke，
 其记录保存在该次 run 的 `wandb/` 下，之后可单独同步。CPU 的 check/prepare/preflight
 继续禁网且不初始化 W&B。
