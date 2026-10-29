@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
-VERL_ROOT=${VERL_ROOT:-/data/zengjiajie/projects/verl/verl}
-ADD_EXPERIMENT=${ADD_EXPERIMENT:-/data/zengjiajie/projects/codemem/swe-add-pairing-20261026/add7-noresults-sft-8gpu-20261029}
-ADD_DELIVERY=${ADD_DELIVERY:-/data/zengjiajie/projects/codemem/swe-add-pairing-20261026/add7-no-tool-results-generation-20261029}
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+VERL_ROOT=${VERL_ROOT:-$(cd -- "$script_dir/../../.." && pwd)}
+run_owner=$(id -un)
+ADD_EXPERIMENT=${ADD_EXPERIMENT:-/data/$run_owner/projects/codemem/swe-add-pairing-20261026/add7-noresults-sft-8gpu-20261029}
+ADD_DELIVERY=${ADD_DELIVERY:-/mnt/users/zengjiajie/add7-no-tool-results-generation-20261029}
 # Existing shared base model, mounted read-only; no download or model server needed.
 MODEL_DIR=${MODEL_DIR:-/data/memory-verl-sft/models/base/Qwen3.5-9B}
 IMAGE=${IMAGE:-verl-sft:qwen3.5-9b-cu130-driver535}
@@ -12,6 +14,9 @@ if (($#)); then shift; fi
 case "$mode" in check|prepare-train|prepare-val|preflight|smoke|train) ;; *) echo 'Use check|prepare-train|prepare-val|preflight|smoke|train' >&2; exit 2;; esac
 mkdir -p "$ADD_EXPERIMENT/reports"
 entry="$VERL_ROOT/examples/sft/add7"
+for required in "$VERL_ROOT/verl" "$ADD_DELIVERY" "$MODEL_DIR"; do
+  [[ -d "$required" && -r "$required" && -x "$required" ]] || { echo "Missing/unreadable: $required" >&2; exit 1; }
+done
 common=(--rm --network none --user "$(id -u):$(id -g)" --shm-size 16g
   -v "$VERL_ROOT:$VERL_ROOT:ro" -v "$ADD_EXPERIMENT:$ADD_EXPERIMENT"
   -v "$ADD_DELIVERY:$ADD_DELIVERY:ro" -v "$MODEL_DIR:/model:ro"
@@ -20,6 +25,8 @@ common=(--rm --network none --user "$(id -u):$(id -g)" --shm-size 16g
   -e TRANSFORMERS_OFFLINE=1 -e WANDB_MODE=disabled -e TOKENIZERS_PARALLELISM=false
   -e OMP_NUM_THREADS=4 -e HYDRA_FULL_ERROR=1 -e ADD_SP_SIZE=4
   -e PYTHONDONTWRITEBYTECODE=1 --entrypoint /usr/bin/env)
+# Preserve NAS dockerteam access for the non-root training user.
+for supplementary_group in $(id -G); do common+=(--group-add "$supplementary_group"); done
 clean=( -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy )
 # CPU modes never request GPUs and do not touch currently running containers.
 if [[ "$mode" == check ]]; then

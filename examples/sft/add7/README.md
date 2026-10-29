@@ -51,3 +51,26 @@ GPU smoke 保留正式 564 步的 LR schedule，只提前在第三步停止；�
 Sampler 无自定义游标状态，由 StatefulDataLoader 保存/恢复已消费位置；trainer 恢复 epoch，再构造相同顺序。不能改变 batch/SP/采样规则后沿用旧 loader checkpoint。
 
 CPU 回归：`python -m unittest discover -s tests/add7 -v`（在该训练镜像中，挂载模型为 `/model`）。覆盖 12,008 行末批、398 val、非零 epoch 恢复、最长样本 smoke、缓存完整监督、错误来源拒绝、packing token 上限和 token 加权 loss/梯度等价。GPU/SP 真正数值回归另见 `tests/special_distributed/test_qwen35_linear_attention_ulysses_sp.py`，本次未占卡运行。
+
+## dyy 接手（204 / dengyiyun）
+
+发布分支为 `https://github.com/jiajieZeng/verl/tree/CodeMem`。请使用自己目录里的新检出，已有训练仓库不要覆盖/reset。下面假设指定源码路径尚不存在；若已存在，请另选新的 `VERL_ROOT`。
+
+```bash
+export VERL_ROOT=/data/dengyiyun/projects/verl/verl-add7-noresults
+mkdir -p "$(dirname "$VERL_ROOT")"
+git clone --branch CodeMem --single-branch https://github.com/jiajieZeng/verl.git "$VERL_ROOT"
+export ADD_EXPERIMENT=/data/dengyiyun/projects/codemem/add7-noresults-sft-8gpu-20261029
+export ADD_DELIVERY=/mnt/users/zengjiajie/add7-no-tool-results-generation-20261029
+mkdir -p "$ADD_EXPERIMENT"
+# 共享包 status.json 标明完整后，复制预编码缓存到自己的本地 NVMe；不重复编码。
+rsync -a --no-owner --no-group /mnt/users/zengjiajie/add7-noresults-sft-8gpu-20261029/prepared/ "$ADD_EXPERIMENT/prepared/"
+cd "$VERL_ROOT/examples/sft/add7"
+./launch_204.sh check
+./launch_204.sh preflight
+./launch_204.sh smoke
+# 等 smoke 容器结束，检查三步 loss/梯度/显存/耗时后：
+./launch_204.sh train
+```
+
+共享交接入口：`/mnt/users/zengjiajie/add7-noresults-sft-8gpu-20261029/README.md`；状态和CPU预检在那里更新，不能把“脚本已完成”当成“GPU已验收”。启动脚本从自身位置推导源码根，输出默认使用当前登录用户的 `/data/<user>/projects/`；容器保留宿主机 supplementary groups，以便读取 dockerteam 组可读 NAS 数据。所有训练结果归运行用户，禁止以其他人的账号启动。当前其他 GPU 任务仍须自然结束或由其负责人安排释放；本脚本不停止它们。
