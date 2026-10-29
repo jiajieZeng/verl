@@ -1,0 +1,82 @@
+defaults:
+  - sft_trainer_engine
+  - _self_
+hydra:
+  searchpath:
+    - file://${oc.env:VERL_ROOT}/verl/trainer/config
+model:
+  path: /model
+  tokenizer_path: /model
+  trust_remote_code: false
+  enable_gradient_checkpointing: true
+  enable_activation_offload: false
+  use_remove_padding: true
+  use_fused_kernels: true
+  fused_kernel_options:
+    impl_backend: torch
+  override_config:
+    attn_implementation: flash_attention_2
+  lora_rank: 0
+  lora:
+    rank: 0
+data:
+  train_files: ${oc.env:ADD_EXPERIMENT}/prepared/train
+  val_files: ${oc.env:ADD_EXPERIMENT}/prepared/val
+  custom_cls:
+    path: ${oc.env:VERL_ROOT}/examples/sft/add7/dataset.py
+    name: Add7CachedDataset
+  enable_thinking_default: false
+  apply_chat_template_kwargs:
+    enable_thinking: false
+  pad_mode: no_padding
+  max_length: 262144
+  truncation: error
+  train_batch_size: 64
+  validation_batch_size: 2
+  micro_batch_size_per_gpu: 1
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 65536
+  num_workers: 0
+engine:
+  strategy: fsdp2
+  fsdp_size: 8
+  model_dtype: float32
+  dtype: bfloat16
+  offload_policy: false
+  param_offload: false
+  optimizer_offload: false
+  reshard_after_forward: true
+  ulysses_sequence_parallel_size: 4
+  use_torch_compile: false
+  use_no_sync_for_gradient_accumulation: false
+  pad_to_length: false
+optim:
+  optimizer: AdamW
+  optimizer_impl: torch.optim
+  betas: [0.9, 0.999]
+  lr: 1.0e-5
+  lr_scheduler_type: cosine
+  lr_warmup_steps: -1
+  lr_warmup_steps_ratio: 0.05
+  min_lr_ratio: 0.1
+  weight_decay: 0.01
+  clip_grad: 1.0
+  override_optimizer_config:
+    foreach: false
+trainer:
+  project_name: codemem-add7-noresults-qwen35
+  experiment_name: ${oc.env:ADD_RUN_ID}
+  default_local_dir: ${oc.env:ADD_RUN_DIR}/checkpoints
+  nnodes: 1
+  n_gpus_per_node: 8
+  total_epochs: 3
+  total_training_steps: null
+  save_freq: after_each_epoch
+  test_freq: after_each_epoch
+  logger: [console]
+  seed: 1
+  resume_mode: disable
+  max_ckpt_to_keep: null
+checkpoint:
+  save_contents: [model, optimizer, extra]
+  load_contents: [model, optimizer, extra]
