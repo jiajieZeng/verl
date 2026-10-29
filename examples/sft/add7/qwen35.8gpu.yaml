@@ -69,11 +69,11 @@ trainer:
   default_local_dir: ${oc.env:ADD_RUN_DIR}/checkpoints
   nnodes: 1
   n_gpus_per_node: 8
-  total_epochs: 3
+  total_epochs: 5
   total_training_steps: null
   save_freq: after_each_epoch
   test_freq: after_each_epoch
-  logger: [console]
+  logger: [console, wandb]
   seed: 1
   resume_mode: disable
   max_ckpt_to_keep: null

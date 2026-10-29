@@ -25,6 +25,16 @@ def sample(identity='a', split='train'):
 
 
 class CoverageTests(unittest.TestCase):
+    def test_recipe_is_five_epochs_with_wandb(self):
+        root = Path(__file__).resolve().parents[2]
+        config = OmegaConf.load(root/'examples/sft/add7/qwen35.8gpu.yaml')
+        self.assertEqual(config.trainer.total_epochs, 5)
+        self.assertEqual(config.trainer.logger, ['console', 'wandb'])
+        launcher = (root/'examples/sft/add7/launch_204.sh').read_text()
+        self.assertNotIn('WANDB_MODE=disabled -e TOKENIZERS', launcher)
+        self.assertIn('WANDB_MODE=${WANDB_MODE:-online}', launcher)
+        self.assertIn('-e WANDB_API_KEY', launcher)
+
     def test_global_batch_membership_and_tail(self):
         lengths = [(i*113)%190000+1000 for i in range(12008)]
         all_ranks = [list(BalancedSampler(lengths, 64, 2, r)) for r in range(2)]

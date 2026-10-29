@@ -14,9 +14,10 @@
 | 计算 | BF16，FP32 参数/Adam 状态，FlashAttention2、fused loss、gradient checkpointing |
 | CPU offload | offload_policy / param_offload / optimizer_offload 全关 |
 | 优化器 | 沿用 Add-4：AdamW，lr 1e-5，cosine，warmup 5%，最小 LR 比例 0.1，weight decay 0.01，clip 1 |
-| epoch | 3；12,008 行对应 188 步/epoch、564 步；末批 40 条完整保留 |
+| epoch | 5；12,008 行对应 188 步/epoch、940 步；末批 40 条完整保留 |
 | thinking / loss | thinking=false，仅原始 summary/facts JSON + im_end；prompt、空 think 前缀及末尾换行均不监督 |
 | 验证 / 保存 | 独立 val398；每个 epoch 验证并保存模型/优化器/loader状态；不做在线题目评测 |
+| 实验记录 | W&B 在线记录逐步 train 指标和每轮 `val/loss`；运行目录同时保留 `metrics.jsonl` |
 
 优化工作量的两层均衡：每个随机 global batch 的成员保持不变，按 `n*(n+24576)` 将样本分到两组 DP，各组样本数相同；组内继续使用 VERL 的动态 packing 和同步 microbatch 数。这个工作量是近似值，实际收益看 GPU 测量，不承诺固定倍数。样本 position 从 0 重置，底层 cu_seqlens 隔离注意力/线性状态；合批不会把不同轨迹变成相互可见的一条上下文。
 
@@ -32,12 +33,19 @@ cd /data/zengjiajie/projects/verl/verl/examples/sft/add7
 ./launch_204.sh preflight             # 核对两份缓存，写 reports/preflight.json
 # 以下两条需要 GPU 空闲，准备工作本身不会执行：
 ./launch_204.sh smoke                 # 最长样本组成的3个 batch64，独立 checkpoint
-./launch_204.sh train                 # 正式3 epoch，从 base 开始，绝不自动复用 smoke
+./launch_204.sh train                 # 正式5 epoch，从 base 开始，绝不自动复用 smoke
 ```
 
-脚本拒绝占用中的 GPU，不停止现有 Add 生成或任何用户任务。CPU 模式不申请 GPU。模型只读挂载已有共享权重 `/data/memory-verl-sft/models/base/Qwen3.5-9B` 为 `/model`；项目内不复制权重。镜像 `verl-sft:qwen3.5-9b-cu130-driver535`，源码显式挂载本仓库且优先于镜像旧 `/opt/verl`。每次启动建立独立 `runs/<mode>-<timestamp>/`，记录源码 HEAD、已有修改、入口副本、镜像ID和 override；Hydra 保存实际完整配置。六项代理清除，网络关闭。
+GPU 模式默认使用 W&B online。启动前在 204 宿主机通过受保护的登录脚本或 secret 注入
+`WANDB_API_KEY`，不要把 key 写进本脚本、命令历史、运行目录或聊天；如需指定团队，额外设置
+`WANDB_ENTITY`。启动器只把已有环境变量名传给临时容器，不打印 key。未配置凭据时 online
+模式会在申请 GPU 前失败；可显式 `WANDB_MODE=offline ./launch_204.sh smoke` 做离线 smoke，
+其记录保存在该次 run 的 `wandb/` 下，之后可单独同步。CPU 的 check/prepare/preflight
+继续禁网且不初始化 W&B。
 
-GPU smoke 保留正式 564 步的 LR schedule，只提前在第三步停止；覆盖较长样本而不是仅测试短样本。它只用于测显存、packing、step time 和 loss，不用于接续正式训练。默认无 CPU offload、SP4/65K 的组合参照旧 Add-4；八卡实测前仍可能需要调 token 预算或 offload，任何调整应记录并重新 smoke。CPU 单测不能代替真实分布式 GPU 验收。
+脚本拒绝占用中的 GPU，不停止现有 Add 生成或任何用户任务。CPU 模式不申请 GPU。模型只读挂载已有共享权重 `/data/memory-verl-sft/models/base/Qwen3.5-9B` 为 `/model`；项目内不复制权重。镜像 `verl-sft:qwen3.5-9b-cu130-driver535`，源码显式挂载本仓库且优先于镜像旧 `/opt/verl`。每次启动建立独立 `runs/<mode>-<timestamp>/`，记录源码 HEAD、已有修改、入口副本、镜像ID和 override；Hydra 保存实际完整配置。六项代理清除；CPU 与离线 GPU 模式禁网，W&B online 的 GPU 模式使用容器默认网络。
+
+GPU smoke 保留正式 940 步的 LR schedule，只提前在第三步停止；覆盖较长样本而不是仅测试短样本。它只用于测显存、packing、step time 和 loss，不用于接续正式训练。默认无 CPU offload、SP4/65K 的组合参照旧 Add-4；八卡实测前仍可能需要调 token 预算或 offload，任何调整应记录并重新 smoke。CPU 单测不能代替真实分布式 GPU 验收。
 
 正式训练 `training.log` 记录每组每步的 microbatch 数、样本数、token 数；`metrics.jsonl` 记录 loss、grad norm、LR、MFU、最慢 rank step 秒数、全机 tokens/s、峰值显存。对比速度时排除加载、首次编译、验证/保存，并观察稳定数步。
 

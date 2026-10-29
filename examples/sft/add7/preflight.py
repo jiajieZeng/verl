@@ -29,7 +29,7 @@ def validate(root):
             exact_coverage=True)
     report = dict(ready=True, training_started=False, gpu_tested=False, world_size=8,
         sp=4, dp=2, global_batch=64, max_tokens_per_microbatch=262144,
-        steps_per_epoch=188, epochs=3, total_steps=564, train_val_group_overlap=0, datasets=info)
+        steps_per_epoch=188, epochs=5, total_steps=940, train_val_group_overlap=0, datasets=info)
     print(json.dumps(report, indent=2))
     return report
 

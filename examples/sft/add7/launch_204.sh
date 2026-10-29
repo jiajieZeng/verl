@@ -17,12 +17,12 @@ entry="$VERL_ROOT/examples/sft/add7"
 for required in "$VERL_ROOT/verl" "$ADD_DELIVERY" "$MODEL_DIR"; do
   [[ -d "$required" && -r "$required" && -x "$required" ]] || { echo "Missing/unreadable: $required" >&2; exit 1; }
 done
-common=(--rm --network none --user "$(id -u):$(id -g)" --shm-size 16g
+common=(--rm --user "$(id -u):$(id -g)" --shm-size 16g
   -v "$VERL_ROOT:$VERL_ROOT:ro" -v "$ADD_EXPERIMENT:$ADD_EXPERIMENT"
   -v "$ADD_DELIVERY:$ADD_DELIVERY:ro" -v "$MODEL_DIR:/model:ro"
   -e "VERL_ROOT=$VERL_ROOT" -e "ADD_EXPERIMENT=$ADD_EXPERIMENT"
   -e "PYTHONPATH=$VERL_ROOT:$entry" -e HOME=/tmp -e HF_HUB_OFFLINE=1
-  -e TRANSFORMERS_OFFLINE=1 -e WANDB_MODE=disabled -e TOKENIZERS_PARALLELISM=false
+  -e TRANSFORMERS_OFFLINE=1 -e TOKENIZERS_PARALLELISM=false
   -e OMP_NUM_THREADS=4 -e HYDRA_FULL_ERROR=1 -e ADD_SP_SIZE=4
   -e PYTHONDONTWRITEBYTECODE=1 --entrypoint /usr/bin/env)
 # Preserve NAS dockerteam access for the non-root training user.
@@ -30,7 +30,8 @@ for supplementary_group in $(id -G); do common+=(--group-add "$supplementary_gro
 clean=( -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy )
 # CPU modes never request GPUs and do not touch currently running containers.
 if [[ "$mode" == check ]]; then
-  docker run "${common[@]}" -e ADD_RUN_ID=config-check -e "ADD_RUN_DIR=$ADD_EXPERIMENT/reports" \
+  docker run --network none "${common[@]}" -e WANDB_MODE=disabled \
+    -e ADD_RUN_ID=config-check -e "ADD_RUN_DIR=$ADD_EXPERIMENT/reports" \
     "$IMAGE" "${clean[@]}" python "$entry/train.py" --config-path "$entry" --config-name qwen35.8gpu --cfg job --resolve "$@"
   exit
 fi
@@ -39,13 +40,13 @@ if [[ "$mode" == prepare-train || "$mode" == prepare-val ]]; then
   if [[ "$split" == train ]]; then source="$ADD_DELIVERY/delivery/messages.jsonl"; count=12008
   else source="$ADD_DELIVERY/val/messages.jsonl"; count=398; fi
   test -s "$source" || { echo "Not delivered yet: $source" >&2; exit 1; }
-  docker run "${common[@]}" "$IMAGE" "${clean[@]}" python "$entry/prepare_data.py" \
+  docker run --network none "${common[@]}" "$IMAGE" "${clean[@]}" python "$entry/prepare_data.py" \
     --source "$source" --output "$ADD_EXPERIMENT/prepared/$split" --tokenizer /model \
     --split "$split" --expected "$count" "$@"
   exit
 fi
 if [[ "$mode" == preflight ]]; then
-  docker run "${common[@]}" "$IMAGE" "${clean[@]}" python "$entry/preflight.py" \
+  docker run --network none "${common[@]}" "$IMAGE" "${clean[@]}" python "$entry/preflight.py" \
     --root "$ADD_EXPERIMENT" --report "$ADD_EXPERIMENT/reports/preflight.json"
   exit
 fi
@@ -65,13 +66,31 @@ for used in "${gpu_memory[@]}"; do
 done
 run_id="${mode}-$(date +%Y%m%dT%H%M%S)"
 run="$ADD_EXPERIMENT/runs/$run_id"
-mkdir -p "$run"
+mkdir -p "$run/wandb"
 git -C "$VERL_ROOT" rev-parse HEAD > "$run/source-head.txt"
 git -C "$VERL_ROOT" status --short > "$run/source-status.txt"
 git -C "$VERL_ROOT" diff > "$run/source-tracked.diff"
 cp "$entry/"*.py "$entry/"*.yaml "$entry/"*.sh "$run/"
 docker image inspect "$IMAGE" --format '{{.Id}}' > "$run/image-id.txt"
 args=(--config-path "$entry" --config-name qwen35.8gpu "hydra.run.dir=$run/hydra")
+WANDB_MODE=${WANDB_MODE:-online}
+case "$WANDB_MODE" in
+  online)
+    [[ -n "${WANDB_API_KEY:-}" ]] || {
+      echo 'WANDB_MODE=online requires WANDB_API_KEY in the host environment; use a protected login/secret, never paste it into the script.' >&2
+      exit 1
+    }
+    network=()
+    wandb_env=(-e WANDB_API_KEY)
+    ;;
+  offline)
+    network=(--network none)
+    wandb_env=()
+    ;;
+  *) echo 'WANDB_MODE must be online or offline for smoke/train.' >&2; exit 2;;
+esac
+wandb_env+=(-e "WANDB_MODE=$WANDB_MODE" -e "WANDB_DIR=$run/wandb")
+[[ -z "${WANDB_ENTITY:-}" ]] || wandb_env+=(-e WANDB_ENTITY)
 if [[ "$mode" == smoke ]]; then
   # Three longest-batch64 updates in an isolated run; keep the full-run LR schedule.
   # Stop after three updates; never use its checkpoint for the formal run.
@@ -79,7 +98,7 @@ if [[ "$mode" == smoke ]]; then
 fi
 printf '%s\n' "$@" > "$run/overrides.txt"
 printf 'Run directory: %s\n' "$run"
-docker run -d --name "zjj-add7-noresults-$run_id" --gpus all "${common[@]}" \
+docker run -d --name "zjj-add7-noresults-$run_id" --gpus all "${network[@]}" "${common[@]}" "${wandb_env[@]}" \
   -e "ADD_RUN_ID=$run_id" -e "ADD_RUN_DIR=$run" "$IMAGE" "${clean[@]}" \
   bash -c 'exec torchrun --standalone --nnodes=1 --nproc_per_node=8 "$1/train.py" "${@:2}" > "$ADD_RUN_DIR/training.log" 2>&1' \
   bash "$entry" "${args[@]}" "$@"
