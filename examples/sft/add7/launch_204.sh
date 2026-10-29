@@ -76,7 +76,9 @@ args=(--config-path "$entry" --config-name qwen35.8gpu "hydra.run.dir=$run/hydra
 WANDB_MODE=${WANDB_MODE:-online}
 case "$WANDB_MODE" in
   online)
-    network=()
+    # The 204 host has no usable docker0 bridge; host networking also avoids
+    # creating a per-container veth while preserving W&B outbound access.
+    network=(--network host)
     if [[ -n "${WANDB_API_KEY:-}" ]]; then
       wandb_env=(-e WANDB_API_KEY)
     elif [[ -r "${HOME}/.netrc" ]]; then

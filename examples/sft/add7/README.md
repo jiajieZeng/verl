@@ -43,7 +43,7 @@ GPU 模式默认使用 W&B online。启动前在 204 宿主机完成 `wandb logi
 其记录保存在该次 run 的 `wandb/` 下，之后可单独同步。CPU 的 check/prepare/preflight
 继续禁网且不初始化 W&B。
 
-脚本拒绝占用中的 GPU，不停止现有 Add 生成或任何用户任务。CPU 模式不申请 GPU。模型只读挂载已有共享权重 `/data/memory-verl-sft/models/base/Qwen3.5-9B` 为 `/model`；项目内不复制权重。镜像 `verl-sft:qwen3.5-9b-cu130-driver535`，源码显式挂载本仓库且优先于镜像旧 `/opt/verl`。每次启动建立独立 `runs/<mode>-<timestamp>/`，记录源码 HEAD、已有修改、入口副本、镜像ID和 override；Hydra 保存实际完整配置。六项代理清除；CPU 与离线 GPU 模式禁网，W&B online 的 GPU 模式使用容器默认网络。
+脚本拒绝占用中的 GPU，不停止现有 Add 生成或任何用户任务。CPU 模式不申请 GPU。模型只读挂载已有共享权重 `/data/memory-verl-sft/models/base/Qwen3.5-9B` 为 `/model`；项目内不复制权重。镜像 `verl-sft:qwen3.5-9b-cu130-driver535`，源码显式挂载本仓库且优先于镜像旧 `/opt/verl`。每次启动建立独立 `runs/<mode>-<timestamp>/`，记录源码 HEAD、已有修改、入口副本、镜像ID和 override；Hydra 保存实际完整配置。六项代理清除；CPU 与离线 GPU 模式禁网，W&B online 的 GPU 模式使用 host 网络，绕过 204 上不可用的 docker0 bridge。
 
 GPU smoke 保留正式 940 步的 LR schedule，只提前在第三步停止；覆盖较长样本而不是仅测试短样本。它只用于测显存、packing、step time 和 loss，不用于接续正式训练。默认无 CPU offload、SP4/65K 的组合参照旧 Add-4；八卡实测前仍可能需要调 token 预算或 offload，任何调整应记录并重新 smoke。CPU 单测不能代替真实分布式 GPU 验收。
 

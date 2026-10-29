@@ -35,6 +35,7 @@ class CoverageTests(unittest.TestCase):
         self.assertIn('WANDB_MODE=${WANDB_MODE:-online}', launcher)
         self.assertIn('-e WANDB_API_KEY', launcher)
         self.assertIn('.netrc:/tmp/.netrc:ro', launcher)
+        self.assertIn('network=(--network host)', launcher)
 
     def test_global_batch_membership_and_tail(self):
         lengths = [(i*113)%190000+1000 for i in range(12008)]
